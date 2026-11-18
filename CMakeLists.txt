@@ -1,0 +1,56 @@
+cmake_minimum_required(VERSION 3.25)
+project(MicPatch VERSION 0.1.0 LANGUAGES CXX)
+
+if(NOT WIN32 OR NOT MSVC)
+    message(FATAL_ERROR "MicPatch requires Windows and the MSVC toolchain.")
+endif()
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_compile_options(/W4 /permissive- /utf-8)
+add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+
+add_library(micpatch_audio STATIC audio.cpp)
+target_link_libraries(micpatch_audio PUBLIC ole32 mfplat mfreadwrite mfuuid avrt uuid cfgmgr32)
+
+add_executable(MicPatch WIN32 main.cpp virtual_device.cpp assets/micpatch.rc)
+target_link_libraries(MicPatch PRIVATE micpatch_audio comctl32 comdlg32 user32 gdi32 setupapi shell32 advapi32)
+
+add_executable(MicPatchDriverInstall WIN32 driver_install.cpp)
+target_link_libraries(MicPatchDriverInstall PRIVATE advapi32 bcrypt setupapi newdev wintrust user32)
+target_link_options(MicPatchDriverInstall PRIVATE /DEPENDENTLOADFLAG:0x800)
+add_dependencies(MicPatch MicPatchDriverInstall)
+
+set(MICPATCH_RELEASE_DRIVER_DIR "" CACHE PATH "Directory containing the final, signed MicPatch release driver package")
+if(MICPATCH_RELEASE_DRIVER_DIR)
+    foreach(extension IN ITEMS inf cat sys)
+        set(artifact "${MICPATCH_RELEASE_DRIVER_DIR}/MicPatchMic.${extension}")
+        if(NOT EXISTS "${artifact}")
+            message(FATAL_ERROR "Missing release driver artifact: ${artifact}")
+        endif()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${artifact}")
+        file(SHA256 "${artifact}" digest)
+        string(TOUPPER "${extension}" kind)
+        list(APPEND driver_pins "MICPATCH_RELEASE_${kind}_SHA256=\"${digest}\"")
+        list(APPEND driver_artifacts "${artifact}")
+    endforeach()
+    target_compile_definitions(MicPatchDriverInstall PRIVATE ${driver_pins})
+    target_compile_definitions(MicPatch PRIVATE MPMIC_PINNED_PACKAGE)
+    add_custom_command(TARGET MicPatch POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:MicPatch>/driver-package"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${driver_artifacts} "$<TARGET_FILE_DIR:MicPatch>/driver-package"
+        VERBATIM)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(mix_tests mix_tests.cpp)
+    add_test(NAME mix_core COMMAND mix_tests)
+    add_executable(settings_tests settings_tests.cpp)
+    target_link_libraries(settings_tests PRIVATE advapi32)
+    add_test(NAME settings_persistence COMMAND settings_tests)
+    add_executable(route_probe route_probe.cpp)
+    target_link_libraries(route_probe PRIVATE micpatch_audio)
+endif()

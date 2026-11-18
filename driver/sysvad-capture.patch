@@ -1,0 +1,1451 @@
+--- a/adapter.cpp
++++ b/adapter.cpp
+@@ -26,6 +26,7 @@
+ 
+ #include "simple.h"
+ #include "minipairs.h"
++#include "MpMicCapture.h"
+ #ifdef SYSVAD_BTH_BYPASS
+ #include "bthhfpminipairs.h"
+ #endif // SYSVAD_BTH_BYPASS
+@@ -250,7 +251,6 @@
+ // DoNotCreateDataFiles (DWORD) = 0 to override this default.
+ //
+ DWORD g_DoNotCreateDataFiles = 1;  // default is off.
+-DWORD g_DisableToneGenerator = 0;  // default is to generate tones.
+ UNICODE_STRING g_RegistryPath;      // This is used to store the registry settings path for the driver
+ 
+ 
+@@ -430,7 +430,6 @@
+     RTL_QUERY_REGISTRY_TABLE    paramTable[] = {
+     // QueryRoutine     Flags                                               Name                     EntryContext             DefaultType                                                    DefaultData              DefaultLength
+         { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"DoNotCreateDataFiles", &g_DoNotCreateDataFiles, (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD, &g_DoNotCreateDataFiles, sizeof(ULONG)},
+-        { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"DisableToneGenerator", &g_DisableToneGenerator, (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD, &g_DisableToneGenerator, sizeof(ULONG)},
+ #ifdef SYSVAD_BTH_BYPASS
+         { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"DisableBthScoBypass",  &g_DisableBthScoBypass,  (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD, &g_DisableBthScoBypass,  sizeof(ULONG)},
+ #endif // SYSVAD_BTH_BYPASS
+@@ -476,7 +475,6 @@
+     // Dump settings.
+     //
+     DPF(D_VERBOSE, ("DoNotCreateDataFiles: %u", g_DoNotCreateDataFiles));
+-    DPF(D_VERBOSE, ("DisableToneGenerator: %u", g_DisableToneGenerator));
+ #ifdef SYSVAD_BTH_BYPASS
+     DPF(D_VERBOSE, ("DisableBthScoBypass: %u", g_DisableBthScoBypass));
+ #endif // SYSVAD_BTH_BYPASS
+@@ -581,6 +579,7 @@
+     //
+     // To intercept stop/remove/surprise-remove.
+     //
++    MpMicInitialize(DriverObject);
+     DriverObject->MajorFunction[IRP_MJ_PNP] = PnpHandler;
+ 
+     //
+@@ -707,170 +706,6 @@
+ 
+ #pragma code_seg("PAGE")
+ NTSTATUS 
+-InstallEndpointRenderFilters(
+-    _In_ PDEVICE_OBJECT     _pDeviceObject, 
+-    _In_ PIRP               _pIrp, 
+-    _In_ PADAPTERCOMMON     _pAdapterCommon,
+-    _In_ PENDPOINT_MINIPAIR _pAeMiniports
+-    )
+-{
+-    NTSTATUS                    ntStatus                = STATUS_SUCCESS;
+-    PUNKNOWN                    unknownTopology         = NULL;
+-    PUNKNOWN                    unknownWave             = NULL;
+-    PPORTCLSETWHELPER           pPortClsEtwHelper       = NULL;
+-#ifdef _USE_IPortClsRuntimePower
+-    PPORTCLSRUNTIMEPOWER        pPortClsRuntimePower    = NULL;
+-#endif // _USE_IPortClsRuntimePower
+-    PPORTCLSStreamResourceManager pPortClsResMgr        = NULL;
+-    PPORTCLSStreamResourceManager2 pPortClsResMgr2      = NULL;
+-
+-    PAGED_CODE();
+-    
+-    UNREFERENCED_PARAMETER(_pDeviceObject);
+-
+-    ntStatus = _pAdapterCommon->InstallEndpointFilters(
+-        _pIrp,
+-        _pAeMiniports,
+-        NULL,
+-        &unknownTopology,
+-        &unknownWave,
+-        NULL, NULL);
+-
+-    if (unknownWave) // IID_IPortClsEtwHelper and IID_IPortClsRuntimePower interfaces are only exposed on the WaveRT port.
+-    {
+-        ntStatus = unknownWave->QueryInterface (IID_IPortClsEtwHelper, (PVOID *)&pPortClsEtwHelper);
+-        if (NT_SUCCESS(ntStatus))
+-        {
+-            _pAdapterCommon->SetEtwHelper(pPortClsEtwHelper);
+-            ASSERT(pPortClsEtwHelper != NULL);
+-            pPortClsEtwHelper->Release();
+-        }
+-
+-#ifdef _USE_IPortClsRuntimePower
+-        // Let's get the runtime power interface on PortCls.  
+-        ntStatus = unknownWave->QueryInterface(IID_IPortClsRuntimePower, (PVOID *)&pPortClsRuntimePower);
+-        if (NT_SUCCESS(ntStatus))
+-        {
+-            // This interface would typically be stashed away for later use.  Instead,
+-            // let's just send an empty control with GUID_NULL.
+-            NTSTATUS ntStatusTest =
+-                pPortClsRuntimePower->SendPowerControl
+-                (
+-                    _pDeviceObject,
+-                    &GUID_NULL,
+-                    NULL,
+-                    0,
+-                    NULL,
+-                    0,
+-                    NULL
+-                );
+-
+-            if (NT_SUCCESS(ntStatusTest) || STATUS_NOT_IMPLEMENTED == ntStatusTest || STATUS_NOT_SUPPORTED == ntStatusTest)
+-            {
+-                ntStatus = pPortClsRuntimePower->RegisterPowerControlCallback(_pDeviceObject, &PowerControlCallback, NULL);
+-                if (NT_SUCCESS(ntStatus))
+-                {
+-                    ntStatus = pPortClsRuntimePower->UnregisterPowerControlCallback(_pDeviceObject);
+-                }
+-            }
+-            else
+-            {
+-                ntStatus = ntStatusTest;
+-            }
+-
+-            pPortClsRuntimePower->Release();
+-        }
+-#endif // _USE_IPortClsRuntimePower
+-
+-        //
+-        // Test: add and remove current thread as streaming audio resource.  
+-        // In a real driver you should only add interrupts and driver-owned threads 
+-        // (i.e., do NOT add the current thread as streaming resource).
+-        //
+-        // testing IPortClsStreamResourceManager:
+-        ntStatus = unknownWave->QueryInterface(IID_IPortClsStreamResourceManager, (PVOID *)&pPortClsResMgr);
+-        if (NT_SUCCESS(ntStatus))
+-        {
+-            PCSTREAMRESOURCE_DESCRIPTOR res;
+-            PCSTREAMRESOURCE hRes = NULL;
+-            PDEVICE_OBJECT pdo = NULL;
+-
+-            PcGetPhysicalDeviceObject(_pDeviceObject, &pdo);
+-            PCSTREAMRESOURCE_DESCRIPTOR_INIT(&res);
+-            res.Pdo = pdo;
+-            res.Type = ePcStreamResourceThread;
+-            res.Resource.Thread = PsGetCurrentThread();
+-            
+-            NTSTATUS ntStatusTest = pPortClsResMgr->AddStreamResource(NULL, &res, &hRes);
+-            if (NT_SUCCESS(ntStatusTest))
+-            {
+-                pPortClsResMgr->RemoveStreamResource(hRes);
+-                hRes = NULL;
+-            }
+-
+-            pPortClsResMgr->Release();
+-            pPortClsResMgr = NULL;
+-        }
+-        
+-        // testing IPortClsStreamResourceManager2:
+-        ntStatus = unknownWave->QueryInterface(IID_IPortClsStreamResourceManager2, (PVOID *)&pPortClsResMgr2);
+-        if (NT_SUCCESS(ntStatus))
+-        {
+-            PCSTREAMRESOURCE_DESCRIPTOR res;
+-            PCSTREAMRESOURCE hRes = NULL;
+-            PDEVICE_OBJECT pdo = NULL;
+-
+-            PcGetPhysicalDeviceObject(_pDeviceObject, &pdo);
+-            PCSTREAMRESOURCE_DESCRIPTOR_INIT(&res);
+-            res.Pdo = pdo;
+-            res.Type = ePcStreamResourceThread;
+-            res.Resource.Thread = PsGetCurrentThread();
+-            
+-            NTSTATUS ntStatusTest = pPortClsResMgr2->AddStreamResource2(pdo, NULL, &res, &hRes);
+-            if (NT_SUCCESS(ntStatusTest))
+-            {
+-                pPortClsResMgr2->RemoveStreamResource(hRes);
+-                hRes = NULL;
+-            }
+-
+-            pPortClsResMgr2->Release();
+-            pPortClsResMgr2 = NULL;
+-        }
+-    }
+-
+-    SAFE_RELEASE(unknownTopology);
+-    SAFE_RELEASE(unknownWave);
+-
+-    return ntStatus;
+-}
+-
+-#pragma code_seg("PAGE")
+-NTSTATUS 
+-InstallAllRenderFilters(
+-    _In_ PDEVICE_OBJECT _pDeviceObject, 
+-    _In_ PIRP           _pIrp, 
+-    _In_ PADAPTERCOMMON _pAdapterCommon
+-    )
+-{
+-    NTSTATUS            ntStatus;
+-    PENDPOINT_MINIPAIR* ppAeMiniports   = g_RenderEndpoints;
+-    
+-    PAGED_CODE();
+-
+-    for(ULONG i = 0; i < g_cRenderEndpoints; ++i, ++ppAeMiniports)
+-    {
+-        ntStatus = InstallEndpointRenderFilters(_pDeviceObject, _pIrp, _pAdapterCommon, *ppAeMiniports);
+-        IF_FAILED_JUMP(ntStatus, Exit);
+-    }
+-    
+-    ntStatus = STATUS_SUCCESS;
+-
+-Exit:
+-    return ntStatus;
+-}
+-
+-#pragma code_seg("PAGE")
+-NTSTATUS 
+ InstallEndpointCaptureFilters(
+     _In_ PDEVICE_OBJECT     _pDeviceObject, 
+     _In_ PIRP               _pIrp, 
+@@ -1053,6 +888,8 @@
+     PUNKNOWN                    pUnknownCommon  = NULL;
+     PortClassDeviceContext*     pExtension      = static_cast<PortClassDeviceContext*>(DeviceObject->DeviceExtension);
+ 
++    PDEVICE_OBJECT              pdo             = nullptr;
++
+     DPF_ENTER(("[StartDevice]"));
+ 
+     //
+@@ -1078,9 +915,11 @@
+     IF_FAILED_JUMP(ntStatus, Exit);
+ 
+     //
+-    // Install wave+topology filters for render devices
+-    //
+-    ntStatus = InstallAllRenderFilters(DeviceObject, Irp, pAdapterCommon);
++    // Prepare the private PCM interface before a stream can be instantiated.
++    //
++    ntStatus = PcGetPhysicalDeviceObject(DeviceObject, &pdo);
++    IF_FAILED_JUMP(ntStatus, Exit);
++    ntStatus = MpMicPrepare(DeviceObject, pdo);
+     IF_FAILED_JUMP(ntStatus, Exit);
+ 
+     //
+@@ -1127,7 +966,11 @@
+     IF_FAILED_JUMP(ntStatus, Exit);
+ #endif // _USE_SingleComponentMultiFxStates
+ 
++    ntStatus = MpMicEnable(DeviceObject);
++
+ Exit:
++    if (!NT_SUCCESS(ntStatus))
++        MpMicStop(DeviceObject);
+ 
+     //
+     // Stash the adapter common object in the device extension so
+@@ -1227,6 +1070,7 @@
+     case IRP_MN_REMOVE_DEVICE:
+     case IRP_MN_SURPRISE_REMOVAL:
+     case IRP_MN_STOP_DEVICE:
++        MpMicStop(_DeviceObject);
+         ext = static_cast<PortClassDeviceContext*>(_DeviceObject->DeviceExtension);
+ 
+         if (ext->m_pCommon != NULL)
+--- a/TabletAudioSample/minipairs.h
++++ b/TabletAudioSample/minipairs.h
+@@ -15,33 +15,9 @@
+ #ifndef _SYSVAD_MINIPAIRS_H_
+ #define _SYSVAD_MINIPAIRS_H_
+ 
+-#include "speakertopo.h"
+-#include "speakertoptable.h"
+-#include "speakerwavtable.h"
+-
+-#include "speakerhptopo.h"
+-#include "speakerhptoptable.h"
+-#include "speakerhpwavtable.h"
+-
+-#include "hdmitopo.h"
+-#include "hdmitoptable.h"
+-#include "hdmiwavtable.h"
+-
+-#include "spdiftopo.h"
+-#include "spdiftoptable.h"
+-#include "spdifwavtable.h"
+-
+ #include "micintopo.h"
+ #include "micintoptable.h"
+ #include "micinwavtable.h"
+-
+-#include "micarraytopo.h"
+-#include "micarray1toptable.h"
+-#include "micarray2toptable.h"
+-#include "micarray3toptable.h"
+-#include "micarraywavtable.h"
+-#include "micarray2wavtable.h"
+-#include "micarray3wavtable.h"
+ 
+ NTSTATUS
+ CreateMiniportWaveRTSYSVAD
+@@ -67,277 +43,6 @@
+     _In_        PENDPOINT_MINIPAIR
+ );
+ 
+-//
+-// Describe buffer size constraints for WaveRT buffers
+-//
+-static struct
+-{
+-    KSAUDIO_PACKETSIZE_CONSTRAINTS2 TransportPacketConstraints;
+-    KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT AdditionalProcessingConstraints[1];
+-} SysvadWaveRtPacketSizeConstraintsRender =
+-{
+-    {
+-        2 * HNSTIME_PER_MILLISECOND,                // 2 ms minimum processing interval
+-        FILE_BYTE_ALIGNMENT,                        // 1 byte packet size alignment
+-        0,                                          // no maximum packet size constraint
+-        2,                                          // 2 processing constraints follow
+-        {
+-            STATIC_AUDIO_SIGNALPROCESSINGMODE_DEFAULT,          // constraint for default processing mode
+-            128,                                                // 128 samples per processing frame
+-            0,                                                  // NA hns per processing frame
+-        },
+-    },
+-    {
+-        {
+-            STATIC_AUDIO_SIGNALPROCESSINGMODE_MOVIE,            // constraint for movie processing mode
+-            1024,                                               // 1024 samples per processing frame
+-            0,                                                  // NA hns per processing frame
+-        },
+-    }
+-};
+-
+-const SYSVAD_DEVPROPERTY SysvadWaveFilterInterfacePropertiesRender[] =
+-{
+-    {
+-        &DEVPKEY_KsAudio_PacketSize_Constraints2,           // Key
+-        DEVPROP_TYPE_BINARY,                                // Type
+-        sizeof(SysvadWaveRtPacketSizeConstraintsRender),    // BufferSize
+-        &SysvadWaveRtPacketSizeConstraintsRender,           // Buffer
+-    },
+-};
+-
+-static struct
+-{
+-    KSAUDIO_PACKETSIZE_CONSTRAINTS2 TransportPacketConstraints;
+-} SysvadWaveRtPacketSizeConstraintsCapture =
+-{
+-    {
+-        2 * HNSTIME_PER_MILLISECOND,                            // 2 ms minimum processing interval
+-        FILE_BYTE_ALIGNMENT,                                    // 1 byte packet size alignment
+-        0x100000,                                               // 1 MB maximum packet size
+-        1,                                                      // 1 processing constraint follows
+-        {
+-            STATIC_AUDIO_SIGNALPROCESSINGMODE_COMMUNICATIONS,   // constraint for communications processing mode
+-            0,                                                  // NA samples per processing frame
+-            20 * HNSTIME_PER_MILLISECOND,                       // 200000 hns (20ms) per processing frame
+-        },
+-    },
+-};
+-
+-const SYSVAD_DEVPROPERTY SysvadWaveFilterInterfacePropertiesCapture[] =
+-{
+-    {
+-        &DEVPKEY_KsAudio_PacketSize_Constraints2,           // Key
+-        DEVPROP_TYPE_BINARY,                                // Type
+-        sizeof(SysvadWaveRtPacketSizeConstraintsCapture),   // BufferSize
+-        &SysvadWaveRtPacketSizeConstraintsCapture,          // Buffer
+-    },
+-};
+-
+-//
+-// Render miniports.
+-//
+-
+-/*********************************************************************
+-* Topology/Wave bridge connection for speaker (internal)             *
+-*                                                                    *
+-*              +------+                +------+                      *
+-*              | Wave |                | Topo |                      *
+-*              |      |                |      |                      *
+-* System   --->|0    2|---> Loopback   |      |                      *
+-*              |      |                |      |                      *
+-* Offload  --->|1    3|--------------->|0    1|---> Line Out         *
+-*              |      |                |      |                      *
+-*              +------+                +------+                      *
+-*********************************************************************/
+-static
+-PHYSICALCONNECTIONTABLE SpeakerTopologyPhysicalConnections[] =
+-{
+-    {
+-        KSPIN_TOPO_WAVEOUT_SOURCE,  // TopologyIn
+-        KSPIN_WAVE_RENDER_SOURCE,   // WaveOut
+-        CONNECTIONTYPE_WAVE_OUTPUT
+-    }
+-};
+-
+-static
+-ENDPOINT_MINIPAIR SpeakerMiniports =
+-{
+-    eSpeakerDevice,
+-    L"TopologySpeaker",                                     // make sure this or the template name matches with KSNAME_TopologySpeaker in the inf's [Strings] section 
+-    NULL,                                                   // optional template name
+-    CreateMiniportTopologySYSVAD,
+-    &SpeakerTopoMiniportFilterDescriptor,
+-    0, NULL,                                                // Interface properties
+-    L"WaveSpeaker",                                         // make sure this or the template name matches with KSNAME_WaveSpeaker in the inf's [Strings] section
+-    NULL,                                                   // optional template name
+-    CreateMiniportWaveRTSYSVAD,
+-    &SpeakerWaveMiniportFilterDescriptor,
+-    ARRAYSIZE(SysvadWaveFilterInterfacePropertiesRender),   // Interface properties
+-    SysvadWaveFilterInterfacePropertiesRender,
+-    SPEAKER_DEVICE_MAX_CHANNELS,
+-    SpeakerPinDeviceFormatsAndModes,
+-    SIZEOF_ARRAY(SpeakerPinDeviceFormatsAndModes),
+-    SpeakerTopologyPhysicalConnections,
+-    SIZEOF_ARRAY(SpeakerTopologyPhysicalConnections),
+-    ENDPOINT_OFFLOAD_SUPPORTED,
+-    SpeakerModulesWaveFilter, 
+-    SIZEOF_ARRAY(SpeakerModulesWaveFilter),
+-    &SpeakerModuleNotificationDeviceId,
+-};
+-
+-/*********************************************************************
+-* Topology/Wave bridge connection for speaker (external:headphone)   *
+-*                                                                    *
+-*              +------+                +------+                      *
+-*              | Wave |                | Topo |                      *
+-*              |      |                |      |                      *
+-* System   --->|0    2|---> Loopback   |      |                      *
+-*              |      |                |      |                      *
+-* Offload  --->|1    3|--------------->|0    1|---> Line Out         *
+-*              |      |                |      |                      *
+-*              +------+                +------+                      *
+-*********************************************************************/
+-static
+-PHYSICALCONNECTIONTABLE SpeakerHpTopologyPhysicalConnections[] =
+-{
+-    {
+-        KSPIN_TOPO_WAVEOUT_SOURCE,  // TopologyIn
+-        KSPIN_WAVE_RENDER_SOURCE,   // WaveOut
+-        CONNECTIONTYPE_WAVE_OUTPUT
+-    }
+-};
+-
+-static
+-ENDPOINT_MINIPAIR SpeakerHpMiniports =
+-{
+-    eSpeakerHpDevice,
+-    L"TopologySpeakerHeadphone",            // make sure this or the template name matches with KSNAME_TopologySpeakerHeadphone in the inf's [Strings] section 
+-    NULL,                                   // optional template name
+-    CreateMiniportTopologySYSVAD,
+-    &SpeakerHpTopoMiniportFilterDescriptor,
+-    0, NULL,                                // Interface properties
+-    L"WaveSpeakerHeadphone",                // make sure this or the template name matches with KSNAME_WaveSpeakerHeadphone in the inf's [Strings] section
+-    NULL,                                   // optional template name
+-    CreateMiniportWaveRTSYSVAD,
+-    &SpeakerHpWaveMiniportFilterDescriptor,
+-    0, NULL,                                // Interface properties
+-    SPEAKERHP_DEVICE_MAX_CHANNELS,
+-    SpeakerHpPinDeviceFormatsAndModes,
+-    SIZEOF_ARRAY(SpeakerHpPinDeviceFormatsAndModes),
+-    SpeakerHpTopologyPhysicalConnections,
+-    SIZEOF_ARRAY(SpeakerHpTopologyPhysicalConnections),
+-    ENDPOINT_OFFLOAD_SUPPORTED,
+-    SpeakerHpModulesWaveFilter, 
+-    SIZEOF_ARRAY(SpeakerHpModulesWaveFilter),
+-    &SpeakerHpModuleNotificationDeviceId,
+-};
+-
+-/*********************************************************************
+-* Topology/Wave bridge connection for hdmi endpoint                  *
+-*                                                                    *
+-*              +------+                +------+                      *
+-*              | Wave |                | Topo |                      *
+-*              |      |                |      |                      *
+-* System   --->|0    1|---> Loopback   |      |                      *
+-*              |      |                |      |                      *
+-*              |     2|--------------->|0    1|---> Line Out         *
+-*              |      |                |      |                      *
+-*              +------+                +------+                      *
+-*********************************************************************/
+-static
+-PHYSICALCONNECTIONTABLE HdmiTopologyPhysicalConnections[] =
+-{
+-    {
+-        KSPIN_TOPO_WAVEOUT_SOURCE,  // TopologyIn
+-        KSPIN_WAVE_RENDER2_SOURCE,  // WaveOut (no offloading)
+-        CONNECTIONTYPE_WAVE_OUTPUT
+-    }
+-};
+-
+-static
+-ENDPOINT_MINIPAIR HdmiMiniports =
+-{
+-    eHdmiRenderDevice,
+-    L"TopologyHdmi",                        // make sure this or the template name matches with KSNAME_TopologyHdmi in the inf's [Strings] section 
+-    NULL,                                   // optional template name
+-    CreateHdmiMiniportTopology,
+-    &HdmiTopoMiniportFilterDescriptor,
+-    0, NULL,                                // Interface properties
+-    L"WaveHdmi",                            // make sure this or the template name matches with KSNAME_WaveHdmi in the inf's [Strings] section
+-    NULL,                                   // optional template name
+-    CreateMiniportWaveRTSYSVAD,
+-    &HdmiWaveMiniportFilterDescriptor,
+-    0, NULL,                                // Interface properties
+-    HDMI_DEVICE_MAX_CHANNELS,
+-    HdmiPinDeviceFormatsAndModes,
+-    SIZEOF_ARRAY(HdmiPinDeviceFormatsAndModes),
+-    HdmiTopologyPhysicalConnections,
+-    SIZEOF_ARRAY(HdmiTopologyPhysicalConnections),
+-    ENDPOINT_LOOPBACK_SUPPORTED,
+-    NULL, 0, NULL,                          // audio module settings.
+-};
+-
+-/*********************************************************************
+-* Topology/Wave bridge connection for spdif (internal)               *
+-*                                                                    *
+-*              +------+                +------+                      *
+-*              | Wave |                | Topo |                      *
+-*              |      |                |      |                      *
+-* System   --->|0    2|---> Loopback   |      |                      *
+-*              |      |                |      |                      *
+-* Offload  --->|1    3|--------------->|0    1|---> Line Out         *
+-*              |      |                |      |                      *
+-*              +------+                +------+                      *
+-*********************************************************************/
+-static
+-PHYSICALCONNECTIONTABLE SpdifTopologyPhysicalConnections[] =
+-{
+-    {
+-        KSPIN_TOPO_WAVEOUT_SOURCE,  // TopologyIn
+-        KSPIN_WAVE_RENDER_SOURCE,   // WaveOut
+-        CONNECTIONTYPE_WAVE_OUTPUT
+-    }
+-};
+-
+-static
+-ENDPOINT_MINIPAIR SpdifMiniports =
+-{
+-    eSpdifRenderDevice,
+-    L"TopologySpdif",                                       // make sure this or the template name matches with KSNAME_TopologySpeaker in the inf's [Strings] section 
+-    NULL,                                                   // optional template name
+-    CreateMiniportTopologySYSVAD,
+-    &SpdifTopoMiniportFilterDescriptor,
+-    0, NULL,                                                // Interface properties
+-    L"WaveSpdif",                                           // make sure this or the template name matches with KSNAME_WaveSpeaker in the inf's [Strings] section
+-    NULL,                                                   // optional template name
+-    CreateMiniportWaveRTSYSVAD,
+-    &SpdifWaveMiniportFilterDescriptor,
+-    ARRAYSIZE(SysvadWaveFilterInterfacePropertiesRender),   // Interface properties
+-    SysvadWaveFilterInterfacePropertiesRender,
+-    SPDIF_DEVICE_MAX_CHANNELS,
+-    SpdifPinDeviceFormatsAndModes,
+-    SIZEOF_ARRAY(SpdifPinDeviceFormatsAndModes),
+-    SpdifTopologyPhysicalConnections,
+-    SIZEOF_ARRAY(SpdifTopologyPhysicalConnections),
+-    ENDPOINT_OFFLOAD_SUPPORTED,
+-    NULL, 0, NULL,                                          // audio module settings.
+-};
+-
+-//
+-// Capture miniports.
+-//
+-
+-/*********************************************************************
+-* Topology/Wave bridge connection for mic in                         *
+-*                                                                    *
+-*              +------+    +------+                                  *
+-*              | Topo |    | Wave |                                  *
+-*              |      |    |      |                                  *
+-*  Mic in  --->|0    1|===>|0    1|---> Capture Host Pin             *
+-*              |      |    |      |                                  *
+-*              +------+    +------+                                  *
+-*********************************************************************/
+ static
+ PHYSICALCONNECTIONTABLE MicInTopologyPhysicalConnections[] =
+ {
+@@ -352,12 +57,12 @@
+ ENDPOINT_MINIPAIR MicInMiniports =
+ {
+     eMicInDevice,
+-    L"TopologyMicIn",                       // make sure this or the template name matches with KSNAME_TopologyMicIn in the inf's [Strings] section 
++    L"TopologyMicPatchMic",                       // make sure this or the template name matches with KSNAME_TopologyMicPatchMic in the inf's [Strings] section 
+     NULL,                                   // optional template name
+     CreateMiniportTopologySYSVAD,
+     &MicInTopoMiniportFilterDescriptor,
+     0, NULL,                                // Interface properties
+-    L"WaveMicIn",                           // make sure this or the template name matches with KSNAME_WaveMicIn in the inf's [Strings] section
++    L"WaveMicPatchMic",                           // make sure this or the template name matches with KSNAME_WaveMicPatchMic in the inf's [Strings] section
+     NULL,                                   // optional template name
+     CreateMiniportWaveRTSYSVAD,
+     &MicInWaveMiniportFilterDescriptor,
+@@ -371,172 +76,8 @@
+     NULL, 0, NULL,                          // audio module settings.
+ };
+ 
+-/*********************************************************************
+-* Topology/Wave bridge connection for mic array  1 (front)           *
+-*                                                                    *
+-*              +------+    +------+                                  *
+-*              | Topo |    | Wave |                                  *
+-*              |      |    |      |                                  *
+-*  Mic in  --->|0    1|===>|0    1|---> Capture Host Pin             *
+-*              |      |    |      |                                  *
+-*              +------+    +------+                                  *
+-*********************************************************************/
+-static
+-PHYSICALCONNECTIONTABLE MicArray1TopologyPhysicalConnections[] =
+-{
+-    {
+-        KSPIN_TOPO_BRIDGE,          // TopologyOut
+-        KSPIN_WAVE_BRIDGE,          // WaveIn
+-        CONNECTIONTYPE_TOPOLOGY_OUTPUT
+-    }
+-};
+-
+-static
+-ENDPOINT_MINIPAIR MicArray1Miniports =
+-{
+-    eMicArrayDevice1,
+-    L"TopologyMicArray1",                                   // make sure this or the template name matches with KSNAME_TopologyMicArray1 in the inf's [Strings] section 
+-    NULL,                                                   // optional template name
+-    CreateMicArrayMiniportTopology,
+-    &MicArray1TopoMiniportFilterDescriptor,
+-    0, NULL,                                                // Interface properties
+-    L"WaveMicArray1",                                       // make sure this or the template name matches with KSNAME_WaveMicArray1 in the inf's [Strings] section
+-    NULL,                                                   // optional template name
+-    CreateMiniportWaveRTSYSVAD,
+-    &MicArrayWaveMiniportFilterDescriptor,
+-    ARRAYSIZE(SysvadWaveFilterInterfacePropertiesCapture),  // Interface properties
+-    SysvadWaveFilterInterfacePropertiesCapture,
+-    MICARRAY_DEVICE_MAX_CHANNELS,
+-    MicArrayPinDeviceFormatsAndModes,
+-    SIZEOF_ARRAY(MicArrayPinDeviceFormatsAndModes),
+-    MicArray1TopologyPhysicalConnections,
+-    SIZEOF_ARRAY(MicArray1TopologyPhysicalConnections),
+-    ENDPOINT_SOUNDDETECTOR_SUPPORTED,
+-    NULL, 0, NULL,                          // audio module settings.
+-};
+-
+-/*********************************************************************
+-* Topology/Wave bridge connection for mic array  2 (back)            *
+-*                                                                    *
+-*              +------+    +------+                                  *
+-*              | Topo |    | Wave |                                  *
+-*              |      |    |      |                                  *
+-*  Mic in  --->|0    1|===>|0    1|---> Capture Host Pin             *
+-*              |      |    |      |                                  *
+-*              +------+    +------+                                  *
+-*********************************************************************/
+-static
+-PHYSICALCONNECTIONTABLE MicArray2TopologyPhysicalConnections[] =
+-{
+-    {
+-        KSPIN_TOPO_BRIDGE,          // TopologyOut
+-        KSPIN_WAVE_BRIDGE,          // WaveIn
+-        CONNECTIONTYPE_TOPOLOGY_OUTPUT
+-    }
+-};
+-
+-static
+-ENDPOINT_MINIPAIR MicArray2Miniports =
+-{
+-    eMicArrayDevice2,
+-    L"TopologyMicArray2",                   // make sure this or the template name matches with KSNAME_TopologyMicArray2 in the inf's [Strings] section 
+-    NULL,                                   // optional template name
+-    CreateMicArrayMiniportTopology,
+-    &MicArray2TopoMiniportFilterDescriptor,
+-    0, NULL,                                // Interface properties
+-    L"WaveMicArray2",                       // make sure this or the template name matches with KSNAME_WaveMicArray2 in the inf's [Strings] section
+-    NULL,                                   // optional template name
+-    CreateMiniportWaveRTSYSVAD,
+-    &MicArray2WaveMiniportFilterDescriptor,
+-    ARRAYSIZE(SysvadWaveFilterInterfacePropertiesCapture),  // Interface properties
+-    SysvadWaveFilterInterfacePropertiesCapture,
+-    MICARRAY2_DEVICE_MAX_CHANNELS,
+-    MicArray2PinDeviceFormatsAndModes,
+-    SIZEOF_ARRAY(MicArray2PinDeviceFormatsAndModes),
+-    MicArray2TopologyPhysicalConnections,
+-    SIZEOF_ARRAY(MicArray2TopologyPhysicalConnections),
+-    ENDPOINT_SOUNDDETECTOR_SUPPORTED,
+-    NULL, 0, NULL,                          // audio module settings.
+-};
+-
+-/*********************************************************************
+-* Topology/Wave bridge connection for mic array  3 (combined)        *
+-*                                                                    *
+-*              +------+    +------+                                  *
+-*              | Topo |    | Wave |                                  *
+-*              |      |    |      |                                  *
+-*  Mic in  --->|0    1|===>|0    1|---> Capture Host Pin             *
+-*              |      |    |      |                                  *
+-*              +------+    +------+                                  *
+-*********************************************************************/
+-static
+-PHYSICALCONNECTIONTABLE MicArray3TopologyPhysicalConnections[] =
+-{
+-    {
+-        KSPIN_TOPO_BRIDGE,          // TopologyOut
+-        KSPIN_WAVE_BRIDGE,          // WaveIn
+-        CONNECTIONTYPE_TOPOLOGY_OUTPUT
+-    }
+-};
+-
+-static
+-ENDPOINT_MINIPAIR MicArray3Miniports =
+-{
+-    eMicArrayDevice3,
+-    L"TopologyMicArray3",                   // make sure this or the template name matches with KSNAME_TopologyMicArray3 in the inf's [Strings] section 
+-    NULL,                                   // optional template name
+-    CreateMicArrayMiniportTopology,
+-    &MicArray3TopoMiniportFilterDescriptor,
+-    0, NULL,                                // Interface properties
+-    L"WaveMicArray3",                       // make sure this or the template name matches with KSNAME_WaveMicArray3 in the inf's [Strings] section
+-    NULL,                                   // optional template name
+-    CreateMiniportWaveRTSYSVAD,
+-    &MicArray3WaveMiniportFilterDescriptor,
+-    0, NULL,                                // Interface properties
+-    MICARRAY3_DEVICE_MAX_CHANNELS,
+-    MicArray3PinDeviceFormatsAndModes,
+-    SIZEOF_ARRAY(MicArray3PinDeviceFormatsAndModes),
+-    MicArray3TopologyPhysicalConnections,
+-    SIZEOF_ARRAY(MicArray3TopologyPhysicalConnections),
+-    ENDPOINT_NO_FLAGS,
+-    NULL, 0, NULL,                          // audio module settings.
+-};
+-
+-//=============================================================================
+-//
+-// Render miniport pairs.
+-//
+-static
+-PENDPOINT_MINIPAIR  g_RenderEndpoints[] = 
+-{
+-    &SpeakerMiniports,
+-    &SpeakerHpMiniports,
+-    &HdmiMiniports,
+-    &SpdifMiniports,
+-};
+-
+-#define g_cRenderEndpoints  (SIZEOF_ARRAY(g_RenderEndpoints))
+-
+-//=============================================================================
+-//
+-// Capture miniport pairs.
+-//
+-static
+-PENDPOINT_MINIPAIR  g_CaptureEndpoints[] = 
+-{
+-    &MicInMiniports,
+-    &MicArray1Miniports,
+-    &MicArray2Miniports,
+-    &MicArray3Miniports,
+-};
+-
++static PENDPOINT_MINIPAIR g_CaptureEndpoints[] = { &MicInMiniports };
+ #define g_cCaptureEndpoints (SIZEOF_ARRAY(g_CaptureEndpoints))
+-
+-//=============================================================================
+-//
+-// Total miniports = # endpoints * 2 (topology + wave).
+-//
+-#define g_MaxMiniports  ((g_cRenderEndpoints + g_cCaptureEndpoints) * 2)
++#define g_MaxMiniports (g_cCaptureEndpoints * 2)
+ 
+ #endif // _SYSVAD_MINIPAIRS_H_
+-
+--- a/TabletAudioSample/micinwavtable.h
++++ b/TabletAudioSample/micinwavtable.h
+@@ -21,194 +21,19 @@
+ #define MICIN_DEVICE_MAX_CHANNELS           1       // Max Channels.
+ #define MICIN_MIN_BITS_PER_SAMPLE_PCM       16      // Min Bits Per Sample
+ #define MICIN_MAX_BITS_PER_SAMPLE_PCM       16      // Max Bits Per Sample
+-#define MICIN_MIN_SAMPLE_RATE               8000    // Min Sample Rate
++#define MICIN_MIN_SAMPLE_RATE               48000   // Min Sample Rate
+ #define MICIN_MAX_SAMPLE_RATE               48000   // Max Sample Rate
+ 
+ //
+ // Max # of pin instances.
+ //
+-#define MICIN_MAX_INPUT_STREAMS             5
++#define MICIN_MAX_INPUT_STREAMS             1
+ 
+ //=============================================================================
+ static 
+ KSDATAFORMAT_WAVEFORMATEXTENSIBLE MicInPinSupportedDeviceFormats[] =
+ {
+-    { // 0
+-        {
+-            sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
+-            0,
+-            0,
+-            0,
+-            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+-            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+-        },
+-        {
+-            {
+-                WAVE_FORMAT_EXTENSIBLE,
+-                1,
+-                8000,
+-                16000,
+-                2,
+-                16,
+-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
+-            },
+-            16,
+-            KSAUDIO_SPEAKER_MONO,
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
+-        }
+-    },
+-    { // 1
+-        {
+-            sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
+-            0,
+-            0,
+-            0,
+-            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+-            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+-        },
+-        {
+-            {
+-                WAVE_FORMAT_EXTENSIBLE,
+-                1,
+-                11025,
+-                22050,
+-                2,
+-                16,
+-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
+-            },
+-            16,
+-            KSAUDIO_SPEAKER_MONO,
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
+-        }
+-    },
+-    { // 2
+-        {
+-            sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
+-            0,
+-            0,
+-            0,
+-            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+-            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+-        },
+-        {
+-            {
+-                WAVE_FORMAT_EXTENSIBLE,
+-                1,
+-                16000,
+-                32000,
+-                2,
+-                16,
+-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
+-            },
+-            16,
+-            KSAUDIO_SPEAKER_MONO,
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
+-        }
+-    },
+-    { // 3
+-        {
+-            sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
+-            0,
+-            0,
+-            0,
+-            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+-            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+-        },
+-        {
+-            {
+-                WAVE_FORMAT_EXTENSIBLE,
+-                1,
+-                22050,
+-                44100,
+-                2,
+-                16,
+-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
+-            },
+-            16,
+-            KSAUDIO_SPEAKER_MONO,
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
+-        }
+-    },
+-    { // 4
+-        {
+-            sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
+-            0,
+-            0,
+-            0,
+-            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+-            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+-        },
+-        {
+-            {
+-                WAVE_FORMAT_EXTENSIBLE,
+-                1,
+-                24000,
+-                48000,
+-                2,
+-                16,
+-                sizeof(WAVEFORMATEXTENSIBLE)-sizeof(WAVEFORMATEX)
+-            },
+-            16,
+-            KSAUDIO_SPEAKER_MONO,
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
+-        }
+-    },
+-    { // 5
+-        {
+-            sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
+-            0,
+-            0,
+-            0,
+-            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+-            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+-        },
+-        {
+-            {
+-                WAVE_FORMAT_EXTENSIBLE,
+-                1,
+-                32000,
+-                64000,
+-                2,
+-                16,
+-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
+-            },
+-            16,
+-            KSAUDIO_SPEAKER_MONO,
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
+-        }
+-    },
+-    { // 6
+-        {
+-            sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
+-            0,
+-            0,
+-            0,
+-            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+-            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+-        },
+-        {
+-            {
+-                WAVE_FORMAT_EXTENSIBLE,
+-                1,
+-                44100,
+-                88200,
+-                2,
+-                16,
+-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
+-            },
+-            16,
+-            KSAUDIO_SPEAKER_MONO,
+-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
+-        }
+-    },
+-    { // 7
++    { // MicPatch transport format
+         {
+             sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
+             0,
+@@ -249,18 +74,7 @@
+         STATIC_AUDIO_SIGNALPROCESSINGMODE_DEFAULT,
+         &MicInPinSupportedDeviceFormats[SIZEOF_ARRAY(MicInPinSupportedDeviceFormats) - 1].DataFormat,
+     },
+-    {
+-        STATIC_AUDIO_SIGNALPROCESSINGMODE_SPEECH,
+-        &MicInPinSupportedDeviceFormats[2].DataFormat, // 16KHz
+-    },
+-    {
+-        STATIC_AUDIO_SIGNALPROCESSINGMODE_COMMUNICATIONS,
+-        &MicInPinSupportedDeviceFormats[4].DataFormat, // 24KHz
+-    },
+-    {
+-        STATIC_AUDIO_SIGNALPROCESSINGMODE_FAR_FIELD_SPEECH,
+-        &MicInPinSupportedDeviceFormats[2].DataFormat, // 16KHz
+-    },
++
+ };
+ 
+ //
+--- a/TabletAudioSample/micintoptable.h
++++ b/TabletAudioSample/micintoptable.h
+@@ -22,9 +22,9 @@
+     );
+ 
+ //
+-// {d48deb08-fd1c-4d1e-b821-9064d49ae96e}
++// {7490358e-88cf-4682-aaf1-da09be2bd467}
+ DEFINE_GUID(MICIN_CUSTOM_NAME, 
+-0xd48deb08, 0xfd1c, 0x4d1e, 0xb8, 0x21, 0x90, 0x64, 0xd4, 0x9a, 0xe9, 0x6e);
++0x7490358e, 0x88cf, 0x4682, 0xaa, 0xf1, 0xda, 0x09, 0xbe, 0x2b, 0xd4, 0x67);
+ 
+ //=============================================================================
+ static
+@@ -35,7 +35,7 @@
+     eConnTypeCombination,
+     eGeoLocRear,
+     eGenLocPrimaryBox,
+-    ePortConnJack,
++    ePortConnIntegratedDevice,
+     TRUE
+ };
+ 
+--- a/TabletAudioSample/TabletAudioSample.rc
++++ b/TabletAudioSample/TabletAudioSample.rc
+@@ -17,9 +17,9 @@
+ 
+ #define VER_FILETYPE                VFT_DRV
+ #define VER_FILESUBTYPE             VFT2_DRV_SOUND
+-#define VER_FILEDESCRIPTION_STR     "Microsoft Virtual Audio Tablet Sample Driver"
+-#define VER_INTERNALNAME_STR        "TabletAudioSample.sys"
+-#define VER_ORIGINALFILENAME_STR    "TabletAudioSample.sys"
++#define VER_FILEDESCRIPTION_STR     "MicPatch Virtual Microphone Driver"
++#define VER_INTERNALNAME_STR        "MicPatchMic.sys"
++#define VER_ORIGINALFILENAME_STR    "MicPatchMic.sys"
+ 
+ #define VER_LEGALCOPYRIGHT_YEARS    "2013"
+ #define VER_LEGALCOPYRIGHT_STR	    "Copyright (C) Microsoft Corp." VER_LEGALCOPYRIGHT_YEARS
+--- a/sysvad.h
++++ b/sysvad.h
+@@ -46,7 +46,7 @@
+ #define SYSVAD_POOLTAG               'DVSM'  
+ 
+ // Debug module name
+-#define STR_MODULENAME              "SYSVAD: "
++#define STR_MODULENAME              "MicPatchMic: "
+ 
+ // Debug utility macros
+ #define D_FUNC                      4
+--- a/EndpointsCommon/minwavertstream.h
++++ b/EndpointsCommon/minwavertstream.h
+@@ -16,7 +16,7 @@
+ #define _SYSVAD_MINWAVERTSTREAM_H_
+ 
+ #include "savedata.h"
+-#include "tonegenerator.h"
++#include "MpMicCapture.h"
+ 
+ 
+ //
+@@ -120,7 +120,7 @@
+     PWAVEFORMATEXTENSIBLE       m_pWfExt;
+     ULONG                       m_ulContentId;
+     CSaveData                   m_SaveData;
+-    ToneGenerator               m_ToneGenerator;
++    MpMicCapture*               m_MpMic;
+     GUID                        m_SignalProcessingMode;
+     BOOLEAN                     m_bEoSReceived;
+     BOOLEAN                     m_bLastBufferRendered;
+@@ -128,16 +128,6 @@
+     AUDIOMODULE *               m_pAudioModules;
+     ULONG                       m_AudioModuleCount;
+     // Member variable as config params for tone generator
+-    ULONG                       m_ulHostCaptureToneFrequency;
+-    ULONG                       m_ulLoopbackCaptureToneFrequency;
+-    // If abs(m_dwHostCaptureToneAmplitude) + abs(m_dwHostCaptureToneDCValue) > 100
+-    // m_dwHostCaptureToneDCValue will be compensated to make the sum equal to 100
+-    DWORD                       m_dwHostCaptureToneAmplitude;   // must be between -100 to 100
+-    DWORD                       m_dwLoopbackCaptureToneAmplitude; // must be between -100 to 100
+-    DWORD                       m_dwHostCaptureToneDCOffset;   // must be between -100 to 100
+-    DWORD                       m_dwLoopbackCaptureToneDCOffset; // must be between -100 to 100
+-    DWORD                       m_dwHostCaptureToneInitialPhase;   // must be between -31416 to 31416
+-    DWORD                       m_dwLoopbackCaptureToneInitialPhase; // must be between -31416 to 31416
+     // Member variable as config params for tone generator
+ 
+ #if defined(SYSVAD_BTH_BYPASS) || defined(SYSVAD_USB_SIDEBAND)
+@@ -307,7 +297,6 @@
+         _Out_opt_  ULONGLONG *      _pullPresentationPosition, 
+         _Out_opt_  LARGE_INTEGER *  _pliQPCTime
+     );
+-    NTSTATUS ReadRegistrySettings();
+ 
+ #if defined(SYSVAD_BTH_BYPASS) || defined(SYSVAD_USB_SIDEBAND)
+     NTSTATUS GetSidebandStreamNtStatus();
+--- a/EndpointsCommon/minwavertstream.cpp
++++ b/EndpointsCommon/minwavertstream.cpp
+@@ -35,6 +35,23 @@
+ --*/
+ {
+     PAGED_CODE();
++    MpMicSetRunning(m_MpMic, this, false);
++    if (m_pNotificationTimer)
++    {
++        ExDeleteTimer
++        (
++            m_pNotificationTimer, 
++            TRUE, // Cancel the timer if it is currently set.
++            TRUE, // Wait for the timer to finish expiring and for any callback to a ExTimerCallback routine to finish.
++            NULL
++         );
++    }
++
++    // Since we just cancelled the notification timer, wait for all queued 
++    // DPCs to complete before we free the notification DPC.
++    //
++    KeFlushQueuedDpcs();
++
+     if (NULL != m_pMiniport)
+     {
+         if (m_pAudioModules)
+@@ -89,88 +106,18 @@
+         ExFreePoolWithTag( m_pWfExt, MINWAVERTSTREAM_POOLTAG );
+         m_pWfExt = NULL;
+     }
+-    if (m_pNotificationTimer)
+-    {
+-        ExDeleteTimer
+-        (
+-            m_pNotificationTimer, 
+-            TRUE, // Cancel the timer if it is currently set.
+-            TRUE, // Wait for the timer to finish expiring and for any callback to a ExTimerCallback routine to finish.
+-            NULL
+-         );
+-    }
+-
+-    // Since we just cancelled the notification timer, wait for all queued 
+-    // DPCs to complete before we free the notification DPC.
+-    //
+-    KeFlushQueuedDpcs();
+-
+ #ifdef SYSVAD_BTH_BYPASS
+     ASSERT(m_SidebandOpen == FALSE);
+     ASSERT(m_SidebandStarted == FALSE);
+ #endif  // SYSVAD_BTH_BYPASS
+ 
++    MpMicRelease(m_MpMic);
++
+     DPF_ENTER(("[CMiniportWaveRTStream::~CMiniportWaveRTStream]"));
+ } // ~CMiniportWaveRTStream
+ 
+ //=============================================================================
+ #pragma code_seg("PAGE")
+-
+-NTSTATUS CMiniportWaveRTStream::ReadRegistrySettings()
+-{
+-    PAGED_CODE();
+-
+-    NTSTATUS                    ntStatus;
+-    PDRIVER_OBJECT              DriverObject;
+-    HANDLE                      DriverKey;
+-
+-    RTL_QUERY_REGISTRY_TABLE    paramTable[] = {
+-        // QueryRoutine     Flags                                               Name                            EntryContext                            DefaultType                                                     DefaultData                                 DefaultLength
+-        { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"HostCaptureToneFrequency",        &m_ulHostCaptureToneFrequency,          (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD,  &m_ulHostCaptureToneFrequency,              sizeof(DWORD) },
+-        { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"LoopbackCaptureToneFrequency",    &m_ulLoopbackCaptureToneFrequency,      (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD,  &m_ulLoopbackCaptureToneFrequency,          sizeof(DWORD) },
+-        { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"HostCaptureToneAmplitude",        &m_dwHostCaptureToneAmplitude,          (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD,  &m_dwHostCaptureToneAmplitude,              sizeof(DWORD) },
+-        { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"LoopbackCaptureToneAmplitude",    &m_dwLoopbackCaptureToneAmplitude,      (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD,  &m_dwLoopbackCaptureToneAmplitude,          sizeof(DWORD) },
+-        { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"HostCaptureToneDCOffset",         &m_dwHostCaptureToneDCOffset,           (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD,  &m_dwHostCaptureToneDCOffset,               sizeof(DWORD) },
+-        { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"LoopbackCaptureToneDCOffset",     &m_dwLoopbackCaptureToneDCOffset,       (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD,  &m_dwLoopbackCaptureToneDCOffset,           sizeof(DWORD) },
+-        { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"HostCaptureToneInitialPhase",     &m_dwHostCaptureToneInitialPhase,       (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD,  &m_dwHostCaptureToneInitialPhase,           sizeof(DWORD) },
+-        { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"LoopbackCaptureToneInitialPhase", &m_dwLoopbackCaptureToneInitialPhase,   (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD,  &m_dwLoopbackCaptureToneInitialPhase,       sizeof(DWORD) },
+-        { NULL,   0,                                                        NULL,                               NULL,                                   0,                                                              NULL,                                       0 }
+-    };
+-
+-    DriverObject = WdfDriverWdmGetDriverObject(WdfGetDriver());
+-    DriverKey = NULL;
+-    ntStatus = IoOpenDriverRegistryKey(DriverObject, 
+-                                 DriverRegKeyParameters,
+-                                 KEY_READ,
+-                                 0,
+-                                 &DriverKey);
+-
+-    if (!NT_SUCCESS(ntStatus))
+-    {
+-        return ntStatus;
+-    }
+-
+-    ntStatus = RtlQueryRegistryValues(RTL_REGISTRY_HANDLE,
+-                                  (PCWSTR) DriverKey,
+-                                  &paramTable[0],
+-                                  NULL,
+-                                  NULL);
+-
+-    if (!NT_SUCCESS(ntStatus)) 
+-    {
+-        DPF(D_VERBOSE, ("RtlQueryRegistryValues failed, using default values, 0x%x", ntStatus));
+-        //
+-        // Don't return error because we will operate with default values.
+-        //
+-    }
+-
+-    if (DriverKey)
+-    {
+-        ZwClose(DriverKey);
+-    }
+-
+-    return ntStatus;
+-}
+ 
+ NTSTATUS
+ CMiniportWaveRTStream::Init
+@@ -221,6 +168,7 @@
+     m_pDmaBuffer = NULL;
+     m_ulNotificationsPerBuffer = 0;
+     m_KsState = KSSTATE_STOP;
++    m_MpMic = nullptr;
+     m_pTimer = NULL;
+     m_pDpc = NULL;
+     m_llPacketCounter = 0;
+@@ -250,14 +198,6 @@
+     m_pAudioModules = NULL;
+     m_AudioModuleCount = 0;
+ 
+-    m_ulHostCaptureToneFrequency = IsEqualGUID(SignalProcessingMode, AUDIO_SIGNALPROCESSINGMODE_RAW) ? 1000 : 2000;
+-    m_ulLoopbackCaptureToneFrequency = 3000; // 3 kHz
+-    m_dwHostCaptureToneAmplitude = 50; 
+-    m_dwLoopbackCaptureToneAmplitude = 50; 
+-    m_dwHostCaptureToneDCOffset = 0; 
+-    m_dwLoopbackCaptureToneDCOffset = 0; 
+-    m_dwHostCaptureToneInitialPhase = 0; 
+-    m_dwLoopbackCaptureToneInitialPhase = 0; 
+ 
+ 
+ #if defined(SYSVAD_BTH_BYPASS) || defined(SYSVAD_USB_SIDEBAND)
+@@ -346,73 +286,13 @@
+ 
+     if (m_bCapture)
+     {
+-        ReadRegistrySettings();
+-            DWORD toneFrequency = 0;
+-            DWORD toneAmplitude = 0;
+-            DWORD toneDCOffset = 0;
+-            DWORD toneInitialPhase = 0;
+-
+-            double toneAmplitudeDouble = 0;
+-            double toneDCOffsetDouble = 0;
+-            double toneInitialPhaseDouble = 0;
+-
+-            if (m_pMiniport->IsLoopbackPin(Pin_))
+-            {
+-                //
+-                // Loopbacks pins use a different frequency for test validation.
+-                //
+-                toneFrequency = m_ulLoopbackCaptureToneFrequency;
+-                toneAmplitude = m_dwLoopbackCaptureToneAmplitude;
+-                toneDCOffset  = m_dwLoopbackCaptureToneDCOffset;
+-                toneInitialPhase = m_dwLoopbackCaptureToneInitialPhase;
+-            }
+-            else
+-            {
+-                //
+-                // Init sine wave generator. To exercise the SignalProcessingMode parameter
+-                // this sample driver selects the frequency based on the parameter.
+-                //
+-                toneFrequency = m_ulHostCaptureToneFrequency;
+-                toneAmplitude = m_dwHostCaptureToneAmplitude;
+-                toneDCOffset  = m_dwHostCaptureToneDCOffset;
+-                toneInitialPhase = m_dwHostCaptureToneInitialPhase;
+-            }
+-
+-            if (labs(toneAmplitude) > 100)
+-            {
+-                toneAmplitude = toneAmplitude > 0 ? 100 : -100;
+-            }
+-
+-            if (labs(toneDCOffset) > 100)
+-            {
+-                toneDCOffset = toneDCOffset > 0 ? 100 : -100;
+-            }
+-
+-            DWORD abssum = labs(toneAmplitude) + labs(toneDCOffset);
+-            
+-            if ( abssum > 100)
+-            {
+-                toneAmplitudeDouble = ((double)toneAmplitude) / abssum;
+-                toneDCOffsetDouble = ((double)toneDCOffset) / abssum;
+-            }
+-            else
+-            {
+-                toneAmplitudeDouble = ((double)toneAmplitude) / 100.0;
+-                toneDCOffsetDouble = ((double)toneDCOffset) / 100.0;
+-            }
+-
+-            if (labs(toneInitialPhase) > 31416)
+-            {
+-                toneInitialPhase = toneInitialPhase > 0 ? 31416 : -31416;
+-            }
+-
+-            toneInitialPhaseDouble = (double)toneInitialPhase / 10000;
+-
+-            ntStatus = m_ToneGenerator.Init(toneFrequency, toneAmplitudeDouble, toneDCOffsetDouble, toneInitialPhaseDouble, m_pWfExt);
+-        if (!NT_SUCCESS(ntStatus))
+-        {
+-            return ntStatus;
+-        }
++        if (pWfEx->nChannels != 1 || pWfEx->wBitsPerSample != 16 ||
++            pWfEx->nSamplesPerSec != MPMIC_RATE || pWfEx->nBlockAlign != sizeof(short) ||
++            pWfEx->nAvgBytesPerSec != MPMIC_RATE * sizeof(short))
++            return STATUS_NO_MATCH;
++        m_MpMic = MpMicReference(m_pMiniport->GetAdapterCommObj()->GetDeviceObject());
++        if (!m_MpMic)
++            return STATUS_DEVICE_NOT_READY;
+     }
+     else if (!g_DoNotCreateDataFiles)
+     {
+@@ -544,7 +424,8 @@
+         return STATUS_UNSUCCESSFUL; 
+     }
+     
+-    if ((NotificationCount_ == 0) || (RequestedSize_ % NotificationCount_ != 0))
++    if (!NotificationCount_ || (RequestedSize_ % m_pWfExt->Format.nBlockAlign) ||
++        ((RequestedSize_ / m_pWfExt->Format.nBlockAlign) % NotificationCount_))
+     {
+         return STATUS_INVALID_PARAMETER;
+     }
+@@ -591,10 +472,16 @@
+     //  A WaveRT miniport driver should not require software access to the audio buffer itself."
+     //   
+     m_pDmaBuffer = (BYTE*)m_pPortStream->MapAllocatedPages(pBufferMdl, MmCached);
++    if (!m_pDmaBuffer)
++    {
++        m_pPortStream->FreePagesFromMdl(pBufferMdl);
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++    RtlZeroMemory(m_pDmaBuffer, RequestedSize_);
+     m_ulNotificationsPerBuffer = NotificationCount_;
+     m_ulDmaBufferSize = RequestedSize_;
+-    ulBufferDurationMs = (RequestedSize_ * 1000) / m_ulDmaMovementRate;
+-    m_ulNotificationIntervalMs = ulBufferDurationMs / NotificationCount_;
++    ulBufferDurationMs = static_cast<ULONG>((RequestedSize_ * 1000ULL) / m_ulDmaMovementRate);
++    m_ulNotificationIntervalMs = max(1UL, ulBufferDurationMs / NotificationCount_);
+ 
+     *AudioBufferMdl_ = pBufferMdl;
+     *ActualSize_ = RequestedSize_;
+@@ -827,6 +714,12 @@
+     //  A WaveRT miniport driver should not require software access to the audio buffer itself."
+     //   
+     m_pDmaBuffer = (BYTE*)m_pPortStream->MapAllocatedPages(pBufferMdl, MmCached);
++    if (!m_pDmaBuffer)
++    {
++        m_pPortStream->FreePagesFromMdl(pBufferMdl);
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++    RtlZeroMemory(m_pDmaBuffer, RequestedSize_);
+ 
+     m_ulDmaBufferSize = RequestedSize_;
+     m_ulNotificationsPerBuffer = 0;
+@@ -1310,6 +1203,8 @@
+             break;
+ 
+         case KSSTATE_RUN:
++            if (m_KsState == KSSTATE_RUN)
++                break;
+ 
+ #if defined(SYSVAD_BTH_BYPASS) || defined(SYSVAD_USB_SIDEBAND)
+             if (m_pMiniport->IsSidebandDevice())
+@@ -1363,7 +1258,10 @@
+             break;
+     }
+ 
++    KeAcquireSpinLock(&m_PositionSpinLock, &oldIrql);
+     m_KsState = State_;
++    MpMicSetRunning(m_MpMic, this, State_ == KSSTATE_RUN);
++    KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);
+ 
+ #if defined(SYSVAD_BTH_BYPASS) || defined(SYSVAD_USB_SIDEBAND)
+ Done:
+@@ -1399,6 +1297,9 @@
+     _In_ LARGE_INTEGER ilQPC
+ )
+ {
++    if (!m_ulDmaBufferSize)
++        return;
++
+     // Convert ticks to 100ns units.
+     LONGLONG  hnsCurrentTime = KSCONVERT_PERFORMANCE_TIME(m_ullPerformanceCounterFrequency.QuadPart, ilQPC);
+     
+@@ -1407,11 +1308,12 @@
+     // may cause us to lose some of the time, so we will carry the remainder forward 
+     // to the next GetPosition() call.
+     //
+-    ULONG TimeElapsedInMS = (ULONG)(hnsCurrentTime - m_ullDmaTimeStamp + m_hnsElapsedTimeCarryForward)/10000;
++    const ULONGLONG elapsed = hnsCurrentTime - m_ullDmaTimeStamp + m_hnsElapsedTimeCarryForward;
++    const ULONGLONG TimeElapsedInMS = elapsed / 10000;
+     
+     // Carry forward the remainder of this division so we don't fall behind with our position too much.
+     //
+-    m_hnsElapsedTimeCarryForward = (hnsCurrentTime - m_ullDmaTimeStamp + m_hnsElapsedTimeCarryForward) % 10000;
++    m_hnsElapsedTimeCarryForward = elapsed % 10000;
+     
+     // Calculate how many bytes in the DMA buffer would have been processed in the elapsed
+     // time.  Note that the division by 1000 to convert to milliseconds may cause us to 
+@@ -1419,15 +1321,17 @@
+     //
+     // need to divide by 1000 because m_ulDmaMovementRate is average bytes per sec.
+ 
+-    ULONG ByteDisplacement = ((m_ulDmaMovementRate * TimeElapsedInMS) + m_byteDisplacementCarryForward) / 1000 ;
+-    m_byteDisplacementCarryForward = ((m_ulDmaMovementRate * TimeElapsedInMS) + m_byteDisplacementCarryForward) % 1000;
++    const ULONGLONG scaledBytes = m_ulDmaMovementRate * TimeElapsedInMS + m_byteDisplacementCarryForward;
++    // Cap extreme delays to an aligned ULONG; preserve frame boundaries.
++    ULONG ByteDisplacement = static_cast<ULONG>(min(scaledBytes / 1000, static_cast<ULONGLONG>(MAXULONG - 1)));
++    m_byteDisplacementCarryForward = static_cast<ULONG>(scaledBytes % 1000);
+ 
+     // Increment presentation position even after last buffer is rendered.
+     m_ullPresentationPosition += ByteDisplacement;
+ 
+     if (m_bCapture)
+     {
+-        // Write sine wave to buffer.
++        // Write producer PCM (or silence) into the capture buffer.
+         WriteBytes(ByteDisplacement);
+     }
+     else
+@@ -1502,24 +1406,19 @@
+ 
+ Routine Description:
+ 
+-This function writes the audio buffer using a sine wave generator
+-Arguments:
+-
+-ByteDisplacement - # of bytes to process.
++Copy at most one DMA buffer; after a scheduling gap, prior cycles are no longer readable.
+ 
+ --*/
+ {
+-    ULONG bufferOffset = m_ullLinearPosition % m_ulDmaBufferSize;
+-
+-    // Normally this will loop no more than once for a single wrap, but if
+-    // many bytes have been displaced then this may loops many times.
+-    while (ByteDisplacement > 0)
+-    {
+-        ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
+-            m_ToneGenerator.GenerateSine(m_pDmaBuffer + bufferOffset, runWrite);
+-        bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
+-        ByteDisplacement -= runWrite;
+-    }
++    if (!ByteDisplacement || !m_pDmaBuffer || !m_ulDmaBufferSize)
++        return;
++
++    const ULONG bytes = min(ByteDisplacement, m_ulDmaBufferSize);
++    const ULONG offset = static_cast<ULONG>((m_ullLinearPosition + ByteDisplacement - bytes) % m_ulDmaBufferSize);
++    const ULONG first = min(bytes, m_ulDmaBufferSize - offset);
++    MpMicRead(m_MpMic, this, reinterpret_cast<short*>(m_pDmaBuffer + offset), first / sizeof(short));
++    if (first < bytes)
++        MpMicRead(m_MpMic, this, reinterpret_cast<short*>(m_pDmaBuffer), (bytes - first) / sizeof(short));
+ }
+ 
+ //=============================================================================
+@@ -1750,6 +1649,11 @@
+ 
+     KIRQL oldIrql;
+     KeAcquireSpinLock(&_this->m_PositionSpinLock, &oldIrql);
++    if (_this->m_KsState != KSSTATE_RUN || !_this->m_ulDmaBufferSize)
++    {
++        KeReleaseSpinLock(&_this->m_PositionSpinLock, oldIrql);
++        return;
++    }
+ 
+     qpc = KeQueryPerformanceCounter(&qpcFrequency);
+ 

@@ -1,0 +1,120 @@
+; MicPatch capture-only WaveRT adapter. build.ps1 substitutes the display name.
+[Version]
+Signature = "$Windows NT$"
+Class = MEDIA
+ClassGUID = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider = %Provider%
+DriverVer = 06/01/2026,1.0.0.0
+CatalogFile = MicPatchMic.cat
+PnpLockDown = 1
+
+[Manufacturer]
+%Provider% = MicPatch,NT$ARCH$.10.0...22621
+
+[MicPatch.NT$ARCH$.10.0...22621]
+%MicName% = MicPatchMic,ROOT\MICPATCHMIC
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+MicPatchMic.sys = 1
+
+[DestinationDirs]
+MicPatch.Copy = 13
+
+[MicPatch.Copy]
+MicPatchMic.sys
+
+[MicPatchMic.NT]
+Include = ks.inf,wdmaudio.inf
+Needs = KS.Registration,WDMAUDIO.Registration
+CopyFiles = MicPatch.Copy
+AddReg = MicPatch.AudioReg
+
+[MicPatch.AudioReg]
+HKR,,AssociatedFilters,,"wdmaud"
+HKR,,Driver,,MicPatchMic.sys
+HKR,Drivers,SubClasses,,"wave,mixer"
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%MicName%
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Description,,%MicName%
+HKR,MediaCategories\{7490358e-88cf-4682-aaf1-da09be2bd467},Name,,%MicName%
+
+[MicPatchMic.NT.HW]
+AddReg = MicPatch.DeviceReg
+
+[MicPatch.DeviceReg]
+; FILE_DEVICE_SOUND and FILE_DEVICE_SECURE_OPEN.
+HKR,,DeviceType,0x00010001,0x1d
+HKR,,DeviceCharacteristics,0x00010001,0x100
+; System, admins and authenticated local apps; no anonymous/world writer ACE.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWGX;;;AU)(A;;GRGWGX;;;RC)"
+
+[MicPatchMic.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,%WaveRef%,MicPatch.Wave
+AddInterface = %KSCATEGORY_CAPTURE%,%WaveRef%,MicPatch.Wave
+AddInterface = %KSCATEGORY_REALTIME%,%WaveRef%,MicPatch.Wave
+AddInterface = %KSCATEGORY_AUDIO%,%TopoRef%,MicPatch.Topology
+AddInterface = %KSCATEGORY_TOPOLOGY%,%TopoRef%,MicPatch.Topology
+AddInterface = %PcmGuid%,MicPatchPcm,MicPatch.Pcm
+
+[MicPatch.Wave]
+AddReg = MicPatch.WaveReg
+AddProperty = MicPatch.InterfaceName
+
+[MicPatch.InterfaceName]
+{026e516e-b814-414b-83cd-856d6fef4822},2,0x00000012,,%MicName%
+
+[MicPatch.WaveReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%MicName%
+
+[MicPatch.Topology]
+AddReg = MicPatch.TopoReg
+AddProperty = MicPatch.InterfaceName
+
+[MicPatch.TopoReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%MicName%
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,1
+
+[MicPatch.Pcm]
+AddReg = MicPatch.PcmReg
+
+[MicPatch.PcmReg]
+HKR,,FriendlyName,,"MicPatch PCM Producer"
+
+[MicPatchMic.NT.Services]
+AddService = MicPatchMic,0x00000002,MicPatch.Service
+
+[MicPatch.Service]
+DisplayName = %MicName%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %13%\MicPatchMic.sys
+
+[MicPatchMic.NT.Wdf]
+KmdfService = MicPatchMic,MicPatch.Wdf
+
+[MicPatch.Wdf]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+Provider = "MicPatch"
+MicName = "@MIC_NAME@"
+DiskName = "MicPatch Driver"
+WaveRef = "WaveMicPatchMic"
+TopoRef = "TopologyMicPatchMic"
+PcmGuid = "{4596f103-3a60-4aa1-985e-7714dcf5ae19}"
+Proxy.CLSID = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_CAPTURE = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+KSNODETYPE_ANY = "{00000000-0000-0000-0000-000000000000}"
+PKEY_AudioEndpoint_Association = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"

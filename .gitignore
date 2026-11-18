@@ -1,0 +1,5 @@
+/build/
+/.vs/
+/.zcode/
+/driver/.scratch/
+/driver/out/

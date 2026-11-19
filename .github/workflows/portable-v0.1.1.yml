@@ -1,0 +1,90 @@
+name: Publish MicPatch v0.1.1 portable
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/portable-v0.1.1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: micpatch-release-v0.1.1
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'Shikaraw/MicPatch' && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      RELEASE_TAG: v0.1.1
+      RELEASE_COMMIT: 13852437dabd3b9803f287b401b72f93226b388f
+    steps:
+      - name: Check out the published source tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: refs/tags/v0.1.1
+          persist-credentials: false
+
+      - name: Verify tag and build Windows x64
+        shell: pwsh
+        run: |
+          $actual = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:RELEASE_COMMIT) {
+            throw 'v0.1.1 does not point to the expected source commit.'
+          }
+          cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 -DBUILD_TESTING=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish portable executable and checksum
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_PROMPT_DISABLED: '1'
+        run: |
+          $exe = 'build/Release/MicPatch.exe'
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksum = 'build/Release/MicPatch.exe.sha256'
+          Set-Content -LiteralPath $checksum -Value "$hash  MicPatch.exe" -Encoding ascii
+          $notes = 'build/release-notes.md'
+          @'
+          ## What's new / 更新内容
+
+          - Mix up to 16 sources: microphones, local files, and playback-device loopback. / 支持最多 16 路音源：麦克风、本地文件和播放设备回环。
+          - Adjust each source independently and play, pause, or loop each file separately. / 每路独立调节，文件可分别播放、暂停和循环。
+          - Automatically restore the last configuration without starting playback or transmission. / 自动恢复上次配置，不会自动播放或发送。
+
+          ## Windows 11 x64 portable / Windows 11 x64 便携版
+
+          Download `MicPatch.exe` and run it directly. No installer or Visual C++ runtime download is needed.
+          To route the mix into a calling app, install VB-CABLE separately if needed. Select `CABLE Input` in MicPatch and the matching recording endpoint (usually `CABLE Output`) in the calling app. This release does not include a signed MicPatch driver.
+
+          下载 `MicPatch.exe` 后直接运行，无需安装 MicPatch 或额外安装 Visual C++ 运行库。
+          通话混音需要另行安装 VB-CABLE（已安装则无需重复安装）。在声搭选择 `CABLE Input` 作为输出，在通话应用选择对应的录音端点（通常为 `CABLE Output`）。本版本不包含已签名的声搭专用驱动。
+          '@ | Set-Content -LiteralPath $notes -Encoding utf8
+
+          $release = gh release list --repo $env:GH_REPO --limit 100 --json tagName --jq '.[] | select(.tagName == "v0.1.1") | .tagName'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($release -eq $env:RELEASE_TAG) {
+            $assets = gh release view $env:RELEASE_TAG --repo $env:GH_REPO --json assets --jq '.assets[].name'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($assets -contains 'MicPatch.exe' -and $assets -contains 'MicPatch.exe.sha256') {
+              Write-Host 'Portable release assets already exist; leaving them unchanged.'
+              exit 0
+            }
+            if ($assets -contains 'MicPatch.exe' -or $assets -contains 'MicPatch.exe.sha256') {
+              throw 'Only one portable asset exists. Refusing to replace or pair it with a different build.'
+            }
+            gh release upload $env:RELEASE_TAG $exe $checksum --repo $env:GH_REPO
+          } else {
+            gh release create $env:RELEASE_TAG $exe $checksum --repo $env:GH_REPO --verify-tag --target $env:RELEASE_COMMIT --title 'MicPatch v0.1.1' --notes-file $notes
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(MicPatch VERSION 0.1.0 LANGUAGES CXX)
+project(MicPatch VERSION 0.1.1 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "MicPatch requires Windows and the MSVC toolchain.")
@@ -53,4 +53,5 @@ if(BUILD_TESTING)
     add_test(NAME settings_persistence COMMAND settings_tests)
     add_executable(route_probe route_probe.cpp)
     target_link_libraries(route_probe PRIVATE micpatch_audio)
+    add_test(NAME reject_output_loopback COMMAND route_probe --reject-self-loop)
 endif()

@@ -24,6 +24,7 @@
 #include <mutex>
 #include <numbers>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -269,9 +270,18 @@ void printReading(const wchar_t* label, Reading r, bool tone) {
 }
 
 int run(int argc, wchar_t** argv) {
-    const bool tone = argc == 5 && std::wstring(argv[4]) == L"--tone440";
-    if (argc != 1 && argc != 4 && !tone) {
-        std::wcerr << L"Usage: route_probe [<render ID/name> <capture ID/name> <audio file> [--tone440]]\n";
+    const bool tone = argc > 1 && std::wstring_view(argv[argc - 1]) == L"--tone440";
+    if (tone) --argc;
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--reject-self-loop") {
+        EngineSession session;
+        const auto error = session.engine.start(L"{test-render-id}", {
+            {micpatch::SourceKind::Loopback, L"{test-render-id}"}});
+        if (error.empty()) throw Failure{L"The engine accepted a loopback of its own output"};
+        std::wcout << L"Rejected loopback of the output endpoint: " << error << std::endl;
+        return 0;
+    }
+    if (argc != 1 && argc != 4 && argc != 6) {
+        std::wcerr << L"Usage: route_probe [<render ID/name> <capture ID/name> <audio file> [--add-file <file> | --loopback <render ID/name>] [--tone440]]\n";
         return 2;
     }
     Apartment com;
@@ -312,17 +322,34 @@ int run(int argc, wchar_t** argv) {
 
     EngineSession session;
     auto& engine = session.engine;
-    engine.fileGain = 1.0f;
-    engine.fileMute = false;
-    engine.outMute = false;
-    engine.loop = true;
-    engine.playing = true;
+    std::vector<micpatch::SourceConfig> sources{{micpatch::SourceKind::File, file, 100, false, true}};
+    if (argc == 6) {
+        const auto mode = std::wstring_view(argv[4]);
+        if (mode == L"--add-file") {
+            sources.push_back({micpatch::SourceKind::File, argv[5], 100, true, true});
+        } else if (mode == L"--loopback") {
+            const auto device = resolve(argv[5], false);
+            if (device.id == micpatch::virtualMicId) throw Failure{L"Loopback needs a Windows playback endpoint"};
+            sources = {{micpatch::SourceKind::Loopback, device.id}};
+        } else {
+            throw Failure{L"Unknown source option"};
+        }
+    }
     const auto startupDeadline = Clock::now() + 6s;
     session.startCalled = true;
-    if (auto error = engine.start(render.id, {}, file); !error.empty())
+    if (auto error = engine.start(render.id, sources); !error.empty())
         throw Failure{L"Engine start: " + error};
-    auto engineError = [&] {
+    EngineSession generator;
+    if (sources.front().kind == micpatch::SourceKind::Loopback) {
+        generator.startCalled = true;
+        if (auto error = generator.engine.start(sources.front().target, {{micpatch::SourceKind::File, file, 25, false, true}});
+            !error.empty()) throw Failure{L"Tone generator: " + error};
+        if (auto* control = generator.engine.source(0)) control->playing = true;
+        else throw Failure{L"Tone generator source is missing"};
+    }
+    const auto engineError = [&] {
         if (auto error = engine.error(); !error.empty()) throw Failure{L"Engine: " + error};
+        if (auto error = generator.engine.error(); !error.empty()) throw Failure{L"Tone generator: " + error};
     };
     for (;;) {
         engineError();
@@ -330,8 +357,11 @@ int run(int argc, wchar_t** argv) {
         if (engine.running()) break;
         std::this_thread::sleep_for(10ms);
     }
-    engine.loop = true;
-    engine.playing = true;
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        auto* control = engine.source(i);
+        if (!control) throw Failure{L"Missing source controls"};
+        if (sources[i].kind == micpatch::SourceKind::File) control->playing = true;
+    }
     const auto health = [&] {
         engineError();
         if (!engine.running()) throw Failure{L"Engine stopped during measurement"};
@@ -366,6 +396,23 @@ int run(int argc, wchar_t** argv) {
         return low.rms;
     };
     const double active = stable(L"Playing (stable min)", minSignal);
+    if (sources.size() == 2) {
+        engine.source(0)->mute = true;
+        engine.source(1)->mute = false;
+        stable(L"Second file alone (stable min)", minSignal);
+        engine.source(0)->gain = 0.5f;
+        engine.source(1)->gain = 0.5f;
+        engine.source(0)->mute = false;
+        const auto deadline = Clock::now() + 2s;
+        while (engine.source(0)->peak.load() <= 0.001f || engine.source(1)->peak.load() <= 0.001f) {
+            health();
+            if (Clock::now() >= deadline) throw Failure{L"Both files did not produce nonzero levels together"};
+            std::this_thread::sleep_for(10ms);
+        }
+        std::wcout << L"Both files are producing audio independently" << std::endl;
+        engine.source(0)->gain = 0;
+        engine.source(1)->gain = 1;
+    }
     engine.outMute = true;
     // Consume (do not measure) in-flight audio for the first 500 ms after the toggle.
     capture.until(Clock::now() + 500ms, [](const BYTE*, UINT32, DWORD) { return false; }, health);

@@ -23,19 +23,19 @@ constexpr Palette paletteFor(micpatch::Theme theme) {
 }
 
 struct SourceRow {
-    HWND select{}, gain{}, mute{};
+    HWND select{}, gain{}, mute{}, play{}, loop{};
     RECT card{}, meter{}, value{};
-    int percent{100}, peak{};
+    int peak{};
+    bool visible{}, missing{}, failed{};
 };
 
 struct App : private Palette {
-    enum class Detail { None, Mic, File };
     HINSTANCE instance;
-    HWND window{}, add{}, refresh{}, micDevice{}, clearMic{}, voiceEq{};
-    HWND filePath{}, clearFile{}, play{}, loop{}, ducking{}, outputDevice{};
+    HWND window{}, add{}, refresh{}, sourceDevice{}, removeSource{}, voiceEq{}, ducking{};
+    HWND filePath{}, chooseFileButton{}, outputDevice{}, sourceScroll{};
     HWND outMute{}, start{}, stop{}, status{}, tooltip{}, virtualDevice{}, settingsButton{};
-    SourceRow mic, file;
-    RECT banner{}, bus{}, master{}, inspector{}, footer{}, outMeter{};
+    std::array<SourceRow, micpatch::maxSources> rows{};
+    RECT banner{}, bus{}, master{}, inspector{}, footer{}, outMeter{}, emptyCard{};
     HFONT font{}, titleFont{}, smallFont{}, boldFont{};
     HICON brandIcon{};
     int brandSize{};
@@ -43,17 +43,28 @@ struct App : private Palette {
     HBRUSH panelBrush = CreateSolidBrush(panel), deepBrush = CreateSolidBrush(deep);
     UINT dpi{96};
     micpatch::Engine engine;
-    std::vector<micpatch::Endpoint> microphones, outputs;
-    std::wstring path, statusText;
-    Detail detail{Detail::None};
-    int outPeak{};
-    bool micAdded{}, active{}, starting{}, statusError{}, muteHotkeyRegistered{}, virtualRefreshPending{};
+    std::vector<micpatch::Endpoint> microphones, outputs, loopbackDevices;
+    std::vector<micpatch::SourceConfig> sources;
+    std::wstring outputId, statusText;
+    size_t detail{kNoSource};
+    int outPeak{}, firstRow{}, rowPage{1}, wheelRemainder{};
+    bool active{}, starting{}, statusError{}, muteHotkeyRegistered{}, virtualRefreshPending{};
+    bool autoSave{}, saveDirty{};
+    LSTATUS saveError{};
     DWORD muteHotkeyError{};
-    ULONGLONG startTick{};
+    ULONGLONG startTick{}, saveAfter{};
 
     explicit App(HINSTANCE module, micpatch::Settings initial)
-        : Palette(paletteFor(initial.theme)), instance(module), preferences(std::move(initial)) {
+        : Palette(paletteFor(initial.theme)), instance(module), preferences(std::move(initial)),
+          autoSave(micpatch::autoSaveEnabled()) {
         engine.outMute.store(preferences.startMuted);
+        if (autoSave) {
+            auto session = micpatch::loadSession();
+            sources = std::move(session.sources);
+            if (preferences.rememberOutput) outputId = std::move(session.outputId);
+        }
+        if (preferences.rememberOutput && outputId.empty()) outputId = preferences.outputId;
+        if (!sources.empty()) detail = 0;
     }
     HBRUSH controlColors(HDC dc, HWND child, bool listBox) const {
         const bool isStatus = child == status;
@@ -112,14 +123,6 @@ struct App : private Palette {
         if (hwnd) SetWindowSubclass(hwnd, comboProc, 1, reinterpret_cast<DWORD_PTR>(this));
         return hwnd;
     }
-    void makeGain(SourceRow& row, int gainId, int muteId) const {
-        row.mute = button(gainId == MicGain ? tr(L"麦克风静音", L"Mute microphone") : tr(L"文件静音", L"Mute file"), muteId);
-        row.gain = control(TRACKBAR_CLASSW, gainId == MicGain ? tr(L"麦克风增益", L"Microphone gain") : tr(L"文件增益", L"File gain"),
-                           WS_TABSTOP | TBS_HORZ | TBS_NOTICKS, gainId);
-        SendMessageW(row.gain, TBM_SETRANGE, FALSE, MAKELPARAM(0, 200));
-        SendMessageW(row.gain, TBM_SETPAGESIZE, 0, 10);
-        SendMessageW(row.gain, TBM_SETPOS, TRUE, 100);
-    }
     void setFont() {
         if (brandSize != px(40)) {
             if (brandIcon) DestroyIcon(brandIcon);
@@ -138,7 +141,7 @@ struct App : private Palette {
         const HFONT use = font ? font : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
         for (HWND child = GetWindow(window, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
             SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(use), TRUE);
-        for (HWND cb : {micDevice, outputDevice}) {
+        for (HWND cb : {sourceDevice, outputDevice}) {
             SendMessageW(cb, CB_SETITEMHEIGHT, 0, px(27));
             SendMessageW(cb, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), px(28));
         }
@@ -156,17 +159,30 @@ struct App : private Palette {
         refresh = button(tr(L"刷新设备", L"Refresh"), Refresh); virtualDevice = button(tr(L"虚拟麦克风", L"Virtual Mic"), VirtualDevice);
         settingsButton = button(tr(L"设置", L"Settings"), OpenSettings);
         add = button(tr(L"＋ 添加音源", L"+ Add Source"), Add);
-        mic.select = button(tr(L"选择麦克风", L"Select microphone"), SelectMic); makeGain(mic, MicGain, MicMute);
-        file.select = button(tr(L"选择本地文件", L"Select local file"), SelectFile); makeGain(file, FileGain, FileMute);
-        play = button(tr(L"播放", L"Play"), Play); loop = button(tr(L"循环播放", L"Loop"), Loop);
-        micDevice = combo(MicDevice);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            auto& row = rows[i];
+            row.select = button(L"", rowId(i, SelectRow));
+            row.mute = button(tr(L"静音", L"Mute"), rowId(i, MuteRow));
+            row.gain = control(TRACKBAR_CLASSW, tr(L"增益", L"Gain"), WS_TABSTOP | TBS_HORZ | TBS_NOTICKS, rowId(i, GainRow));
+            row.play = button(tr(L"播放", L"Play"), rowId(i, PlayRow));
+            row.loop = button(tr(L"循环播放", L"Loop"), rowId(i, LoopRow));
+            for (auto child : {row.select, row.mute, row.gain, row.play, row.loop}) {
+                if (!child) return false;
+                ShowWindow(child, SW_HIDE);
+            }
+            SendMessageW(row.gain, TBM_SETRANGE, FALSE, MAKELPARAM(0, 200));
+            SendMessageW(row.gain, TBM_SETPAGESIZE, 0, 10);
+        }
+        sourceScroll = control(L"SCROLLBAR", L"", SBS_VERT | WS_TABSTOP, ScrollSources);
+        sourceDevice = combo(SourceDevice);
         filePath = control(L"STATIC", L"", SS_CENTERIMAGE | SS_PATHELLIPSIS | SS_NOTIFY | SS_NOPREFIX);
-        voiceEq = button(tr(L"人声清晰 EQ", L"Voice clarity EQ"), VoiceEq); ducking = button(tr(L"自动压低伴奏", L"Auto-duck audio"), Ducking);
-        clearMic = button(tr(L"移除麦克风", L"Remove microphone"), ClearMic); clearFile = button(tr(L"移除文件", L"Remove file"), ClearFile);
+        chooseFileButton = button(tr(L"更换文件…", L"Change File…"), ChooseFile);
+        voiceEq = button(tr(L"人声清晰 EQ", L"Voice clarity EQ"), VoiceEq);
+        ducking = button(tr(L"自动压低此音源", L"Auto-duck this source"), Ducking);
+        removeSource = button(tr(L"移除音源", L"Remove Source"), RemoveSource);
         status = control(L"STATIC", L"", SS_LEFT | SS_NOPREFIX);
-        for (HWND child : {start, stop, outMute, outputDevice, refresh, virtualDevice, settingsButton, add, mic.select,
-                           mic.gain, mic.mute, file.select, file.gain, file.mute, play, loop, micDevice,
-                           filePath, voiceEq, ducking, clearMic, clearFile, status})
+        for (HWND child : {start, stop, outMute, outputDevice, refresh, virtualDevice, settingsButton, add,
+                           sourceScroll, sourceDevice, filePath, chooseFileButton, voiceEq, ducking, removeSource, status})
             if (!child) return false;
         tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP |
                                   TTS_NOPREFIX, CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,
@@ -180,6 +196,10 @@ struct App : private Palette {
         }
         setFont();
         return true;
+    }
+    static void showControl(HWND hwnd, bool visible) {
+        if (((GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_VISIBLE) != 0) != visible)
+            ShowWindow(hwnd, visible ? SW_SHOWNA : SW_HIDE);
     }
     void place(HWND hwnd, int x, int y, int width, int height) const {
         if (hwnd) MoveWindow(hwnd, px(x), px(y), px(std::max(0,width)), px(height), FALSE);
@@ -202,21 +222,51 @@ struct App : private Palette {
         place(virtualDevice,side+busLeft-128,137,116,27);
         place(outputDevice,side+14,168,busLeft-122,224); place(refresh,side+busLeft-99,168,87,32);
         place(add,side+leftW-124,231,124,34);
-        const auto card = [&](SourceRow& row, int y, int height) {
-            row.card = box(side,y,leftW,height);
-            row.meter = box(side+14,y+57,leftW-28,15);
-            row.value = box(side+leftW-66,y+76,52,24);
-            place(row.select,side+8,y+6,leftW-96,45); place(row.mute,side+leftW-78,y+12,64,31);
-            place(row.gain,side+61,y+76,leftW-134,24);
-        };
-        card(mic,277,108);
-        const int fy = micAdded ? 395 : 277;
-        card(file,fy,149);
-        place(play,side+14,fy+108,74,30); place(loop,side+98,fy+108,112,30);
+        constexpr int top = 277, pitch = 134, height = 124;
+        rowPage = std::max(1, (h - 70 - top + (pitch - height)) / pitch);
+        const int count = static_cast<int>(sources.size());
+        firstRow = std::clamp(firstRow, 0, std::max(0, count - rowPage));
+        const bool scrollable = count > rowPage;
+        const int cardW = leftW - (scrollable ? 23 : 0);
+        emptyCard = box(side,top,leftW,height);
+        const HWND focus = GetFocus();
+        bool moveFocus = focus == sourceScroll && !scrollable;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            auto& row = rows[i];
+            const int slot = static_cast<int>(i) - firstRow;
+            row.visible = i < sources.size() && slot >= 0 && slot < rowPage;
+            const bool file = row.visible && sources[i].kind == SourceKind::File;
+            if (!row.visible && (focus == row.select || focus == row.mute || focus == row.gain ||
+                                 focus == row.play || focus == row.loop)) moveFocus = true;
+            if (!file && (focus == row.play || focus == row.loop)) moveFocus = true;
+            if (row.visible) {
+                const int y = top + slot*pitch;
+                row.card = box(side,y,cardW,height);
+                row.meter = box(side+14,y+52,cardW-28,15);
+                row.value = box(side+cardW-65,y+68,51,24);
+                place(row.select,side+8,y+5,cardW-96,42); place(row.mute,side+cardW-78,y+10,64,31);
+                place(row.gain,side+61,y+68,cardW-134,24);
+                if (file) {
+                    place(row.play,side+14,y+92,74,26);
+                    place(row.loop,side+98,y+92,112,26);
+                }
+            }
+            for (auto child : {row.select, row.mute, row.gain}) showControl(child, row.visible);
+            showControl(row.play, file); showControl(row.loop, file);
+        }
+        if (scrollable) {
+            SCROLLINFO scroll{sizeof(SCROLLINFO), SIF_RANGE | SIF_PAGE | SIF_POS,
+                              0, count-1, static_cast<UINT>(rowPage), firstRow, 0};
+            SetScrollInfo(sourceScroll, SB_CTL, &scroll, TRUE);
+            place(sourceScroll,side+leftW-16,top,16,(rowPage-1)*pitch+height);
+        }
+        showControl(sourceScroll, scrollable);
+        if (moveFocus) SetFocus(scrollable ? sourceScroll : count ? rows[static_cast<size_t>(firstRow)].select : refresh);
         const int rx = rightX+15, rw = inspectorW-30;
-        place(micDevice,rx,325,rw,218); place(filePath,rx+7,325,rw-14,32);
-        place(voiceEq,rx,380,rw,34); place(ducking,rx,380,rw,34);
-        place(clearMic,rx,471,rw,34); place(clearFile,rx,471,rw,34);
+        place(sourceDevice,rx,325,rw,218); place(filePath,rx+7,325,rw-14,32);
+        place(chooseFileButton,rx,365,rw,32);
+        place(voiceEq,rx,369,rw,34); place(ducking,rx,405,rw,34);
+        place(removeSource,rx,510,rw,30);
         place(status,20,h-60,w-40,38);
         RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE | RDW_ALLCHILDREN);
     }
@@ -244,6 +294,11 @@ struct App : private Palette {
             stroke(dc,pts,6,mint);
             fill(dc,{x-px(1),y+px(6),x+px(1),y+px(10)},mint);
             fill(dc,{x-px(4),y+px(9),x+px(4),y+px(10)},mint);
+        } else if (kind == 3) {
+            const POINT speaker[]{{x-px(9),y-px(4)},{x-px(5),y-px(4)},{x,y-px(8)},
+                {x,y+px(8)},{x-px(5),y+px(4)},{x-px(9),y+px(4)},{x-px(9),y-px(4)}};
+            const POINT waves[]{{x+px(4),y-px(6)},{x+px(8),y-px(3)},{x+px(8),y+px(3)},{x+px(4),y+px(6)}};
+            stroke(dc,speaker,7,mint,2); stroke(dc,waves,4,mint);
         } else {
             const POINT pts[]{{x,y+px(4)},{x,y-px(8)},{x+px(7),y-px(6)},{x+px(7),y-px(2)}};
             stroke(dc,pts,4,mint,2);
@@ -271,9 +326,8 @@ struct App : private Palette {
              single|DT_RIGHT,smallFont);
     }
     std::wstring routeName() const {
-        const auto id = selectedId(outputDevice,outputs);
-        for (const auto& endpoint : outputs) if (endpoint.id == id) return endpoint.name;
-        return tr(L"尚未选择输出", L"No output selected");
+        if (const auto* endpoint = findEndpoint(outputs, outputId)) return endpoint->name;
+        return outputId.empty() ? tr(L"尚未选择输出", L"No output selected") : tr(L"输出设备缺失", L"Output device missing");
     }
     void drawScene(HDC dc, const RECT& client) const {
         fill(dc,client,bg); fill(dc,banner,deep);
@@ -292,7 +346,7 @@ struct App : private Palette {
 
         rounded(dc,bus,panel,line,14);
         RECT route = bus; route.right = master.left-px(25);
-        const bool virtualMic = selectedId(outputDevice,outputs) == kVirtualMicOutputId;
+        const bool virtualMic = outputId == kVirtualMicOutputId;
         text(dc,virtualMic ? tr(L"通话软件里选择这个麦克风", L"SELECT THIS MIC IN YOUR CALL APP") : tr(L"通话路由  /  输出设备", L"CALL ROUTING  /  OUTPUT DEVICE"),
              part(route,14,10,4,18),mint,single,smallFont);
         text(dc,routeName(),part(route,14,29,4,29),ink,single,titleFont);
@@ -308,40 +362,45 @@ struct App : private Palette {
             RECT r{x-px(i ? 18 : 0),outMeter.bottom+px(6),x+px(i==4 ? 0 : 25),outMeter.bottom+px(25)};
             text(dc,scale[i],r,sub,single|(i==4 ? DT_RIGHT : i ? DT_CENTER : DT_LEFT),smallFont);
         }
-        const int count = static_cast<int>(micAdded)+static_cast<int>(!path.empty());
         text(dc,tr(L"音源", L"Sources"),box(20,229,85,37),ink,single,titleFont);
-        text(dc,std::to_wstring(count)+tr(L" 路", count == 1 ? L" source" : L" sources"),box(108,232,86,35),sub,single,smallFont);
-        const auto card = [&](const SourceRow& row, Detail selected) {
-            const bool picked = detail == selected;
+        text(dc,std::to_wstring(sources.size())+L" / "+std::to_wstring(micpatch::maxSources),box(108,232,72,35),sub,single,smallFont);
+        for (size_t i = 0; i < sources.size(); ++i) {
+            const auto& row = rows[i];
+            if (!row.visible) continue;
+            const bool picked = detail == i;
             rounded(dc,row.card,panel,picked ? mint : line,13);
             if (picked) fill(dc,{row.card.left+1,row.card.top+px(15),
                                  row.card.left+px(3),row.card.bottom-px(15)},mint);
             drawMeter(dc,row);
-            text(dc,tr(L"增益", L"Gain"),part(row.card,14,76,0,24),sub,single,smallFont);
-            text(dc,std::to_wstring(row.percent)+L"%",row.value,ink,single|DT_RIGHT,smallFont);
-        };
-        if (micAdded) card(mic,Detail::Mic);
-        if (!path.empty()) card(file,Detail::File);
-        if (!count) {
-            rounded(dc,mic.card,panel,line,13);
-            text(dc,tr(L"还没有音源", L"No sources yet"),part(mic.card,16,15,16,29),ink,single,boldFont);
-            text(dc,tr(L"通过「添加音源」接入麦克风或本地音频文件。", L"Use Add Source to add a microphone or a local audio file."),
-                 part(mic.card,16,49,16,27),sub,single,smallFont);
+            text(dc,tr(L"增益", L"Gain"),part(row.card,14,68,0,24),sub,single,smallFont);
+            text(dc,std::to_wstring(sources[i].gain)+L"%",row.value,ink,single|DT_RIGHT,smallFont);
+        }
+        if (sources.empty()) {
+            rounded(dc,emptyCard,panel,line,13);
+            text(dc,tr(L"还没有音源", L"No sources yet"),part(emptyCard,16,15,16,29),ink,single,boldFont);
+            text(dc,tr(L"可添加麦克风、本地音频文件和播放回环。", L"Add microphones, local audio files, or playback loopback."),
+                 part(emptyCard,16,49,16,55),sub,DT_WORDBREAK,smallFont);
         }
 
         rounded(dc,inspector,panel,line,14);
         text(dc,tr(L"音源设置", L"SOURCE SETTINGS"),part(inspector,15,12,15,19),mint,single,smallFont);
-        text(dc,detail==Detail::Mic ? tr(L"麦克风", L"Microphone") : detail==Detail::File ? tr(L"本地文件", L"Local File") : tr(L"未选中音源", L"No Source Selected"),
+        const bool selected = detail < sources.size();
+        text(dc,selected ? sourceKindName(sources[detail].kind) : tr(L"未选中音源", L"No Source Selected"),
              part(inspector,15,32,15,33),ink,single,titleFont);
-        if (detail != Detail::None) {
-            text(dc,detail==Detail::Mic ? tr(L"录音设备", L"Recording device") : tr(L"音频文件", L"Audio file"),part(inspector,15,70,15,20),sub,single,smallFont);
-            if (detail==Detail::File) {
-                rounded(dc,part(inspector,15,94,15,34),panel,line);
-                text(dc,tr(L"播放与循环在左侧音源卡片。", L"Play and loop are on the source card."),part(inspector,15,129,15,20),sub,single,smallFont);
-            }
-            text(dc,active ? tr(L"停止发送后可更换设备或移除音源。", L"Stop sending to change devices or remove this source.") :
-                 detail==Detail::Mic ? tr(L"切换录音设备后再启动发送。", L"Choose a recording device before sending.") : tr(L"启动发送后可手动播放文件。", L"Start sending, then press Play to play the file."),
-                 part(inspector,15,189,15,40),sub,DT_WORDBREAK,smallFont);
+        if (selected) {
+            const auto kind = sources[detail].kind;
+            const bool file = kind == SourceKind::File, loopback = kind == SourceKind::Loopback;
+            text(dc,file ? tr(L"音频文件", L"Audio file") : loopback ? tr(L"播放设备", L"Playback device") : tr(L"录音设备", L"Recording device"),
+                 part(inspector,15,70,15,20),sub,single,smallFont);
+            if (file) rounded(dc,part(inspector,15,94,15,34),panel,line);
+            const wchar_t* hint = loopback
+                ? tr(L"回环捕获该设备的全部播放声音，可能包含通话对方。请选择与发送输出不同的设备。",
+                     L"Loopback captures all playback on this device, including callers. Pick a different device from the sending output.")
+                : rows[detail].missing || rows[detail].failed
+                    ? tr(L"此音源不可用。停止发送后可刷新设备或更换来源。", L"This source is unavailable. Stop sending to refresh devices or change the source.")
+                    : file ? tr(L"启动发送后，使用卡片上的播放和循环按钮。", L"Start sending, then use Play and Loop on the source card.")
+                           : tr(L"停止发送后可更换或移除此音源。", L"Stop sending to change or remove this source.");
+            text(dc,hint,part(inspector,15,216,15,60),loopback || rows[detail].missing || rows[detail].failed ? warn : sub,DT_WORDBREAK,smallFont);
         } else {
             text(dc,tr(L"添加音源后，选择左侧卡片可查看设备、文件及混音设置。", L"Select a source card to see its device, file, and mixing options."),
                  part(inspector,15,75,15,78),sub,DT_WORDBREAK);
@@ -358,7 +417,9 @@ struct App : private Palette {
             hotkey += tr(L" 注册失败（错误 ", L" registration failed (error ") + std::to_wstring(muteHotkeyError) +
                       tr(L"）。可手动总静音。", L"). Use the mute button instead.");
         }
-        text(dc,hotkey,part(footer,20,48,20,18),(disabled || muteHotkeyRegistered) ? sub : warn,single,smallFont);
+        if (saveError != ERROR_SUCCESS) hotkey = tr(L"无法自动保存会话（错误 ", L"Autosave failed (error ") +
+                                                 std::to_wstring(saveError) + tr(L"）。", L").");
+        text(dc,hotkey,part(footer,20,48,20,18),saveError == ERROR_SUCCESS && (disabled || muteHotkeyRegistered) ? sub : warn,single,smallFont);
     }
     void paint() const {
         PAINTSTRUCT ps{}; HDC dc = BeginPaint(window,&ps);
@@ -378,13 +439,22 @@ struct App : private Palette {
         }
         EndPaint(window,&ps);
     }
+    static size_t controlRow(int id) {
+        return id < FirstSourceControl ? kNoSource : static_cast<size_t>(id - FirstSourceControl) / RowControlCount;
+    }
+    static int rowAction(int id) { return (id - FirstSourceControl) % RowControlCount; }
     bool toggleState(int id) const {
-        switch (id) {
-        case MicMute: return engine.micMute.load(); case FileMute: return engine.fileMute.load();
-        case OutMute: return engine.outMute.load(); case VoiceEq: return engine.voiceEq.load();
-        case Ducking: return engine.ducking.load(); case Loop: return engine.loop.load();
-        default: return false;
+        if (id == OutMute) return engine.outMute.load();
+        if (detail < sources.size()) {
+            if (id == VoiceEq) return sources[detail].voiceEq;
+            if (id == Ducking) return sources[detail].ducking;
         }
+        const auto index = controlRow(id);
+        if (index < sources.size()) {
+            if (rowAction(id) == MuteRow) return sources[index].mute;
+            if (rowAction(id) == LoopRow) return sources[index].loop;
+        }
+        return false;
     }
     void drawButton(const DRAWITEMSTRUCT& item) const {
         const auto id = static_cast<int>(item.CtlID);
@@ -393,23 +463,24 @@ struct App : private Palette {
         const bool focus = (item.itemState & ODS_FOCUS) != 0;
         const bool on = toggleState(id);
         const auto r = item.rcItem;
-        if (id == SelectMic || id == SelectFile) {
-            const bool isMic = id==SelectMic;
+        const auto index = controlRow(id);
+        const auto action = index < sources.size() ? rowAction(id) : -1;
+        if (action == SelectRow) {
+            const auto kind = sources[index].kind;
             const auto bgColor = pressed ? raised : panel;
             fill(item.hDC,r,panel);
             rounded(item.hDC,inset(r,1,1),bgColor,focus ? mint : bgColor);
-            glyph(item.hDC,{r.left+px(6),r.top+px(5),r.left+px(40),r.top+px(39)},isMic ? 1 : 2);
-            const auto name = isMic ? std::wstring(tr(L"麦克风", L"Microphone")) : path.substr(path.find_last_of(L"\\/")+1);
-            auto desc = isMic ? caption(micDevice) : std::wstring(tr(L"本地音频文件", L"Local audio file"));
-            if (desc.empty()) desc = tr(L"请选择录音设备", L"Select a recording device");
-            text(item.hDC,name,part(r,49,1,6,23),ink,single,boldFont);
-            text(item.hDC,desc,part(r,49,23,6,17),sub,single,smallFont);
+            glyph(item.hDC,{r.left+px(6),r.top+px(4),r.left+px(40),r.top+px(38)},
+                  kind == SourceKind::Microphone ? 1 : kind == SourceKind::File ? 2 : 3);
+            const bool unavailable = rows[index].missing || rows[index].failed;
+            text(item.hDC,sourceName(index),part(r,49,0,6,22),ink,single,boldFont);
+            text(item.hDC,sourceDescription(index),part(r,49,21,6,17),unavailable ? warn : sub,single,smallFont);
             return;
         }
         const COLORREF base = id==Start || id==Stop || id==OutMute ? deep :
                               id==Refresh || id==Add ? (id==Add ? bg : panel) : panel;
         const bool primary = !disabled && (id==Start || (id==OutMute && !on));
-        const bool warm = on && (id==MicMute || id==FileMute || id==OutMute);
+        const bool warm = on && (action==MuteRow || id==OutMute);
         const COLORREF face = disabled ? base : primary ? (pressed ? accentPressed : mint) :
                               warm ? danger : pressed || on ? raised : panel;
         const COLORREF edge = focus ? (primary ? ink : mint) : disabled ? line :
@@ -418,8 +489,8 @@ struct App : private Palette {
         fill(item.hDC,r,base);
         rounded(item.hDC,inset(r,1,1),face,edge);
         auto title = caption(item.hwndItem);
-        if (id==MicMute || id==FileMute) title = on ? tr(L"已静音", L"Muted") : tr(L"静音", L"Mute");
-        else if (on && (id==VoiceEq || id==Ducking || id==Loop)) title = L"✓  " + title;
+        if (action==MuteRow) title = on ? tr(L"已静音", L"Muted") : tr(L"静音", L"Mute");
+        else if (on && (id==VoiceEq || id==Ducking || action==LoopRow)) title = L"✓  " + title;
         text(item.hDC,title,inset(r,3,0),fg,single|DT_CENTER,primary ? boldFont : nullptr);
         if (focus && primary) roundedFocus(item.hDC,inset(r,4,4),accentText);
     }

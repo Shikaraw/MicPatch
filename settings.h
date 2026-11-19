@@ -15,7 +15,7 @@ struct Settings {
     bool english{};
     Theme theme{Theme::Graphite};
     MuteHotkey hotkey{MuteHotkey::Standard};
-    bool rememberOutput{};
+    bool rememberOutput{true};
     bool startMuted{};
     std::wstring outputId;
 };

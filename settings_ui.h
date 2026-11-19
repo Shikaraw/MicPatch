@@ -16,6 +16,40 @@
         return true;
     }
 
+    bool applyAutoSave(bool enabled, bool rememberChanged, HWND owner) {
+        const auto warnSave = [&](const wchar_t* text, LSTATUS error) {
+            const auto detail = text + std::to_wstring(error) + tr(L"）。", L").");
+            MessageBoxW(owner, detail.c_str(), tr(L"设置", L"Settings"), MB_OK | MB_ICONWARNING);
+        };
+        const bool changed = enabled != autoSave;
+        if (changed) {
+            const auto error = micpatch::setAutoSaveEnabled(enabled);
+            if (error != ERROR_SUCCESS) {
+                warnSave(tr(L"无法更改自动保存设置（错误 ", L"Could not change the autosave setting (error "), error);
+                if (rememberChanged && autoSave) { saveDirty = true; flushSession(); }
+                return false;
+            }
+            autoSave = enabled;
+        }
+        if (!autoSave) {
+            KillTimer(window, kSaveTimer);
+            saveDirty = false;
+            saveError = ERROR_SUCCESS;
+            const auto error = micpatch::clearSession();
+            if (error != ERROR_SUCCESS) {
+                warnSave(tr(L"自动保存已关闭，但无法删除旧会话（错误 ", L"Autosave is off, but the old session could not be deleted (error "), error);
+            }
+            InvalidateRect(window, &footer, FALSE);
+        } else if (changed || rememberChanged || saveError != ERROR_SUCCESS) {
+            saveDirty = true;
+            if (!flushSession()) {
+                warnSave(tr(L"无法保存会话（错误 ", L"Could not save the session (error "), saveError);
+                return false;
+            }
+        }
+        return true;
+    }
+
     static INT_PTR CALLBACK settingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
         if (message == WM_INITDIALOG) {
             const auto& app = *reinterpret_cast<App*>(lParam);
@@ -26,6 +60,8 @@
             SetDlgItemTextW(dialog, IDC_SETTINGS_HOTKEY_LABEL, tr(L"总静音热键", L"Master mute hotkey"));
             SetDlgItemTextW(dialog, IDC_SETTINGS_REMEMBER,
                 tr(L"记住输出设备（不会自动发送）", L"Remember output device (never auto-starts sending)"));
+            SetDlgItemTextW(dialog, IDC_SETTINGS_AUTOSAVE,
+                tr(L"自动保存音源与混音设置（不会自动播放）", L"Autosave sources and mix settings (no autoplay)"));
             SetDlgItemTextW(dialog, IDC_SETTINGS_START_MUTED,
                 tr(L"启动应用时默认总静音", L"Mute all output when the app starts"));
             SetDlgItemTextW(dialog, IDC_SETTINGS_NOTE,
@@ -47,6 +83,7 @@
                  tr(L"关闭", L"Off")});
             CheckDlgButton(dialog, IDC_SETTINGS_REMEMBER, app.preferences.rememberOutput ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(dialog, IDC_SETTINGS_START_MUTED, app.preferences.startMuted ? BST_CHECKED : BST_UNCHECKED);
+            CheckDlgButton(dialog, IDC_SETTINGS_AUTOSAVE, app.autoSave ? BST_CHECKED : BST_UNCHECKED);
             return TRUE;
         }
         if (message == WM_CLOSE || (message == WM_COMMAND && LOWORD(wParam) == IDCANCEL)) {
@@ -66,10 +103,11 @@
             next.hotkey = static_cast<micpatch::MuteHotkey>(hotkey);
             next.rememberOutput = IsDlgButtonChecked(dialog, IDC_SETTINGS_REMEMBER) == BST_CHECKED;
             next.startMuted = IsDlgButtonChecked(dialog, IDC_SETTINGS_START_MUTED) == BST_CHECKED;
-            if (!next.rememberOutput) next.outputId.clear();
-            else if (auto selected = selectedId(app->outputDevice, app->outputs); !selected.empty())
-                next.outputId = std::move(selected);
-            if (app->storePreferences(std::move(next), dialog)) EndDialog(dialog, IDOK);
+            const bool rememberChanged = next.rememberOutput != app->preferences.rememberOutput;
+            next.outputId = next.rememberOutput ? app->outputId : std::wstring{};
+            const bool enabled = IsDlgButtonChecked(dialog, IDC_SETTINGS_AUTOSAVE) == BST_CHECKED;
+            if (app->storePreferences(std::move(next), dialog) && app->applyAutoSave(enabled, rememberChanged, dialog))
+                EndDialog(dialog, IDOK);
             return TRUE;
         }
         return FALSE;

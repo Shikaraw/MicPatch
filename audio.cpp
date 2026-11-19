@@ -60,9 +60,29 @@ ComPtr<IMMDeviceEnumerator> enumerator() {
     return result;
 }
 
-ComPtr<IAudioClient> client(const std::wstring& id) {
+ComPtr<IMMDevice> deviceFor(const std::wstring& id) {
     ComPtr<IMMDevice> device;
     check(enumerator()->GetDevice(id.c_str(), &device));
+    return device;
+}
+
+std::wstring endpointId(IMMDevice* device) {
+    LPWSTR id{};
+    check(device->GetId(&id));
+    const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> storage(id, CoTaskMemFree);
+    return id;
+}
+
+bool sameEndpoint(const std::wstring& a, const std::wstring& b) {
+    return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+ComPtr<IAudioClient> client(IMMDevice* device, EDataFlow expected) {
+    ComPtr<IMMEndpoint> endpoint;
+    check(device->QueryInterface(IID_PPV_ARGS(&endpoint)));
+    EDataFlow flow{};
+    check(endpoint->GetDataFlow(&flow));
+    if (flow != expected) throw E_INVALIDARG;
     ComPtr<IAudioClient> result;
     check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                            reinterpret_cast<void**>(result.GetAddressOf())));
@@ -72,6 +92,76 @@ ComPtr<IAudioClient> client(const std::wstring& id) {
 WAVEFORMATEX monoFormat() {
     return {WAVE_FORMAT_IEEE_FLOAT, 1, rate, rate * sizeof(float), sizeof(float), 32, 0};
 }
+
+struct SampleFormat {
+    unsigned channels{}, sampleRate{}, alignment{}, bits{};
+    bool floating{};
+
+    void validate() const {
+        if (!channels || channels > 32 || sampleRate < 8000 || sampleRate > 384000 ||
+            (floating ? (bits != 32 && bits != 64) : (bits != 8 && bits != 16 && bits != 24 && bits != 32)) ||
+            alignment != channels * (bits / 8)) throw MF_E_INVALIDMEDIATYPE;
+    }
+
+    float mono(const BYTE* frame) const {
+        const auto stride = bits / 8;
+        float sum{};
+        for (unsigned ch = 0; ch < channels; ++ch, frame += stride) {
+            float value{};
+            if (floating && bits == 32) {
+                std::memcpy(&value, frame, sizeof(value));
+            } else if (floating) {
+                double wide{};
+                std::memcpy(&wide, frame, sizeof(wide));
+                if (std::isfinite(wide)) value = static_cast<float>(std::clamp(wide, -1.0, 1.0));
+            } else if (bits == 8) {
+                value = (int(*frame) - 128) / 128.0f;
+            } else {
+                std::uint32_t word{};
+                std::memcpy(&word, frame, stride);
+                value = static_cast<float>(static_cast<std::int32_t>(word << (32 - bits))) / 2147483648.0f;
+            }
+            if (std::isfinite(value)) sum += std::clamp(value, -1.0f, 1.0f);
+        }
+        return sum / static_cast<float>(channels);
+    }
+};
+
+SampleFormat mixFormat(const WAVEFORMATEX& format) {
+    constexpr GUID pcm{DEFINE_WAVEFORMATEX_GUID(WAVE_FORMAT_PCM)};
+    constexpr GUID ieee{DEFINE_WAVEFORMATEX_GUID(WAVE_FORMAT_IEEE_FLOAT)};
+    bool floating = format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT;
+    bool integer = format.wFormatTag == WAVE_FORMAT_PCM;
+    if (format.wFormatTag == WAVE_FORMAT_EXTENSIBLE && format.cbSize >= 22) {
+        const auto& extended = reinterpret_cast<const WAVEFORMATEXTENSIBLE&>(format);
+        floating = IsEqualGUID(extended.SubFormat, ieee);
+        integer = IsEqualGUID(extended.SubFormat, pcm);
+    }
+    if (!integer && !floating) throw AUDCLNT_E_UNSUPPORTED_FORMAT;
+    SampleFormat decoded{format.nChannels, format.nSamplesPerSec, format.nBlockAlign,
+                         format.wBitsPerSample, floating};
+    decoded.validate();
+    return decoded;
+}
+
+struct Resampler {
+    unsigned phase{};
+    float previous{};
+    bool havePrevious{};
+
+    template<class Emit>
+    void next(float value, unsigned sampleRate, const Emit& emit) {
+        if (havePrevious) {
+            while (phase < rate) {
+                emit(previous + (value - previous) * (static_cast<float>(phase) / rate));
+                phase += sampleRate;
+            }
+            phase -= rate;
+        }
+        previous = value;
+        havePrevious = true;
+    }
+};
 
 bool waitAudio(HANDLE stop, HANDLE stream) {
     const HANDLE handles[]{stop, stream};
@@ -254,37 +344,99 @@ HRESULT virtualCaptureName(const std::wstring& instance, std::wstring& name) {
     }
 }
 
+struct Engine::Source {
+    const SourceConfig config;
+    SourceControls controls;
+    Ring<8192> queue;
+    std::atomic<unsigned> epoch{};
+    std::thread worker;
+
+    explicit Source(const SourceConfig& value) : config(value) {
+        controls.gain = static_cast<float>(std::clamp(value.gain, 0, 200)) / 100.0f;
+        controls.mute = value.mute;
+        controls.loop = value.loop;
+        controls.voiceEq = value.voiceEq;
+        controls.ducking = value.ducking;
+    }
+};
+
+Engine::Engine() = default;
 Engine::~Engine() { stop(); }
 
-std::wstring Engine::start(const std::wstring& output, const std::wstring& mic, const std::wstring& file) {
+std::wstring Engine::start(const std::wstring& output, const std::vector<SourceConfig>& sources) {
     if (active_) return tr(L"音频引擎已在运行。", L"The audio engine is already running.");
     stop();
-    if (output.empty() || (mic.empty() && file.empty())) return tr(L"请选择输出设备并添加至少一个音源。", L"Select an output and add at least one source.");
-    if (output == virtualMicId && !mic.empty()) {
-        try {
-            Com com;
-            ComPtr<IMMDevice> device;
-            ComPtr<IPropertyStore> properties;
-            check(enumerator()->GetDevice(mic.c_str(), &device));
-            check(device->OpenPropertyStore(STGM_READ, &properties));
-            if (isVirtualMic(properties.Get())) return tr(L"不能把麦克风（声搭）同时设为音源和输出。", L"MicPatch Microphone cannot be both the source and the output.");
-        } catch (HRESULT) {
-            return tr(L"无法验证麦克风音源，请刷新设备后重试。", L"Could not verify the microphone. Refresh the device list and try again.");
-        }
-    }
     {
         std::scoped_lock lock(errorMutex_);
-        error_.clear();
+        outputError_.clear();
+        for (auto& message : sourceErrors_) message.clear();
     }
+    if (output.empty() || sources.empty())
+        return tr(L"请选择输出设备并添加至少一个音源。", L"Select an output and add at least one source.");
+    if (output.find(L'\0') != std::wstring::npos)
+        return tr(L"输出设备标识无效。", L"Invalid output device ID.");
+    if (sources.size() > maxSources)
+        return tr(L"最多可添加 16 路音源。", L"At most 16 audio sources are supported.");
+
+    const bool direct = sameEndpoint(output, virtualMicId);
+    auto outputId = direct ? std::wstring(virtualMicId) : output;
+    const auto collision = [] {
+        return tr(L"不能回采当前的输出设备。", L"The selected output device cannot also be a loopback source.");
+    };
+    if (std::any_of(sources.begin(), sources.end(), [&](const auto& config) {
+            return config.kind == SourceKind::Loopback && config.target.find(L'\0') == std::wstring::npos &&
+                   sameEndpoint(config.target, outputId);
+        })) return collision();
+
+    // Missing devices are diagnosed in their own workers. Detect known feedback
+    // paths before starting any streams, then check again when opening capture.
+    const auto targetKind = direct ? SourceKind::Microphone : SourceKind::Loopback;
+    const auto needsCheck = [&](const SourceConfig& config) {
+        return config.kind == targetKind && !config.target.empty() &&
+            config.target.find(L'\0') == std::wstring::npos;
+    };
+    if (std::any_of(sources.begin(), sources.end(), needsCheck)) {
+        try {
+            Com com;
+            if (!direct) outputId = endpointId(deviceFor(outputId).Get());
+            for (const auto& config : sources) {
+                if (!needsCheck(config)) continue;
+                try {
+                    auto device = deviceFor(config.target);
+                    if (!direct) {
+                        if (sameEndpoint(endpointId(device.Get()), outputId)) return collision();
+                    } else {
+                        ComPtr<IPropertyStore> properties;
+                        check(device->OpenPropertyStore(STGM_READ, &properties));
+                        if (isVirtualMic(properties.Get()))
+                            return tr(L"不能把麦克风（声搭）同时设为音源和输出。", L"MicPatch Microphone cannot be both the source and the output.");
+                    }
+                } catch (HRESULT) {}
+            }
+        } catch (HRESULT) {}
+    }
+
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!stopEvent_) return tr(L"无法创建音频线程停止事件。", L"Could not create the audio stop event.");
-    micLost_ = fileLost_ = false;
-    micEpoch_ = 0;
-    active_ = true;
     try {
-        if (!mic.empty()) captureThread_ = std::thread(&Engine::capture, this, mic);
-        if (!file.empty()) fileThread_ = std::thread(&Engine::decode, this, file);
-        renderThread_ = std::thread(&Engine::render, this, output, !mic.empty(), !file.empty());
+        for (const auto& config : sources) {
+            sources_[sourceCount_] = std::make_unique<Source>(config);
+            ++sourceCount_;
+        }
+        active_ = true;
+        for (std::size_t i = 0; i < sourceCount_; ++i) {
+            auto& source = *sources_[i];
+            if (source.config.target.empty() || source.config.target.find(L'\0') != std::wstring::npos) {
+                failSource(i, tr(L"未选择有效音源目标", L"No valid source target selected"), E_INVALIDARG);
+                continue;
+            }
+            try {
+                source.worker = std::thread(&Engine::runSource, this, i, outputId);
+            } catch (const std::system_error&) {
+                failSource(i, tr(L"无法创建音源线程", L"Could not start source thread"), E_FAIL);
+            }
+        }
+        renderThread_ = std::thread(&Engine::render, this, std::move(outputId));
     } catch (const std::exception&) {
         stop();
         return tr(L"无法创建音频线程。", L"Could not start the audio threads.");
@@ -292,117 +444,267 @@ std::wstring Engine::start(const std::wstring& output, const std::wstring& mic, 
     return {};
 }
 
+SourceControls* Engine::source(std::size_t index) {
+    return index < sourceCount_ ? &sources_[index]->controls : nullptr;
+}
+
 void Engine::stop() {
     if (stopEvent_) SetEvent(stopEvent_);
     if (renderThread_.joinable()) renderThread_.join();
-    if (captureThread_.joinable()) captureThread_.join();
-    if (fileThread_.joinable()) fileThread_.join();
+    for (std::size_t i = 0; i < sourceCount_; ++i) {
+        auto& slot = sources_[i];
+        if (slot->worker.joinable()) slot->worker.join();
+        slot.reset();
+    }
+    sourceCount_ = 0;
     if (stopEvent_) CloseHandle(stopEvent_);
     stopEvent_ = nullptr;
     ready_ = false;
     active_ = false;
-    micPeak = filePeak = outPeak = 0;
-    micQueue_.reset();
-    fileQueue_.reset();
+    outPeak = 0;
 }
 
-void Engine::fail(const wchar_t* context, HRESULT code) {
+static std::wstring errorMessage(const wchar_t* context, HRESULT code) {
     wchar_t hex[20]{};
     swprintf_s(hex, L"0x%08lX", static_cast<unsigned long>(code));
+    return std::wstring(context) + L"（" + hex + L"）";
+}
+
+void Engine::failSource(std::size_t index, const wchar_t* context, HRESULT code) {
+    auto& controls = sources_[index]->controls;
+    {
+        std::scoped_lock lock(errorMutex_);
+        sourceErrors_[index] = std::wstring(tr(L"音源 ", L"Source ")) + std::to_wstring(index + 1) +
+            L": " + errorMessage(context, code);
+    }
+    controls.failed = true;
+    controls.playing = false;
+    controls.peak = 0;
+}
+
+void Engine::failOutput(const wchar_t* context, HRESULT code) {
     std::scoped_lock lock(errorMutex_);
-    if (!error_.empty()) error_ += L"；";
-    error_ += std::wstring(context) + L"（" + hex + L"）";
+    outputError_ = errorMessage(context, code);
 }
 
 std::wstring Engine::error() {
     std::scoped_lock lock(errorMutex_);
-    return error_;
+    auto result = outputError_;
+    for (const auto& message : sourceErrors_) {
+        if (message.empty()) continue;
+        if (!result.empty()) result += L"；";
+        result += message;
+    }
+    return result;
 }
 
-void Engine::capture(std::wstring id) {
+std::wstring Engine::outputError() {
+    std::scoped_lock lock(errorMutex_);
+    return outputError_;
+}
+
+void Engine::runSource(std::size_t index, const std::wstring& output) {
+    auto& source = *sources_[index];
+    const auto kind = source.config.kind;
+    const auto report = [&](HRESULT hr) {
+        if (WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0) return;
+        const auto context = kind == SourceKind::File ?
+            tr(L"文件读取失败，请检查文件格式或访问权限", L"Could not read the file. Check its format and permissions.") :
+            hr == E_ACCESSDENIED ?
+            tr(L"无法安全地连接音源，请检查权限或设备路由", L"Could not safely connect the source. Check permissions or device routing.") :
+            kind == SourceKind::Loopback ?
+            tr(L"应用声音采集失败，请检查播放设备", L"Loopback capture failed. Check the playback device.") :
+            tr(L"麦克风采集失败，请检查设备", L"Microphone capture failed. Check the device.");
+        failSource(index, context, hr);
+    };
     try {
-        Com com;
-        Event event;
-        auto audio = client(id);
-        auto format = monoFormat();
-        check(audio->Initialize(AUDCLNT_SHAREMODE_SHARED, conversion | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                200000, 0, &format, nullptr));
-        check(audio->SetEventHandle(event.handle));
-        ComPtr<IAudioCaptureClient> input;
-        check(audio->GetService(IID_PPV_ARGS(&input)));
-        AudioPriority priority;
-        Started started(audio.Get());
-        bool firstPacket = true;
-        while (waitAudio(stopEvent_, event.handle)) {
-            for (;;) {
-                UINT32 pending{};
-                check(input->GetNextPacketSize(&pending));
-                if (!pending) break;
-                BYTE* data{};
-                UINT32 frames{};
-                DWORD flags{};
-                check(input->GetBuffer(&data, &frames, &flags, nullptr, nullptr));
-                if (!firstPacket && (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)) ++micEpoch_;
-                firstPacket = false;
-                const auto samples = reinterpret_cast<const float*>(data);
-                for (UINT32 i = 0; i < frames; ++i) {
-                    if (!micQueue_.push(flags & AUDCLNT_BUFFERFLAGS_SILENT ? 0 : samples[i])) {
-                        ++micEpoch_;
-                        break;
-                    }
-                }
-                check(input->ReleaseBuffer(frames));
-                if (WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0) return;
-            }
+        switch (kind) {
+        case SourceKind::Microphone:
+        case SourceKind::Loopback: capture(source, output); break;
+        case SourceKind::File: decode(source); break;
+        default: throw E_INVALIDARG;
         }
     } catch (HRESULT hr) {
-        micLost_ = true;
-        fail(tr(L"麦克风采集已停止，请检查设备后重新启动", L"Microphone capture stopped. Check the device and restart."), hr);
+        report(hr);
+    } catch (const std::bad_alloc&) {
+        report(E_OUTOFMEMORY);
+    } catch (const std::exception&) {
+        report(E_FAIL);
+    }
+}
+
+void Engine::capture(Source& source, const std::wstring& output) {
+    Com com;
+    Event event;
+    const bool loopback = source.config.kind == SourceKind::Loopback;
+    const bool direct = output == virtualMicId;
+    auto device = deviceFor(source.config.target);
+    if (direct && !loopback) {
+        ComPtr<IPropertyStore> properties;
+        check(device->OpenPropertyStore(STGM_READ, &properties));
+        if (isVirtualMic(properties.Get())) throw E_ACCESSDENIED;
+    }
+    // Recheck immediately before opening a loopback stream, including devices
+    // that were unavailable during start(). Fail closed if output cannot resolve.
+    if (!direct && loopback && sameEndpoint(endpointId(device.Get()), endpointId(deviceFor(output).Get())))
+        throw E_ACCESSDENIED;
+    auto audio = client(device.Get(), loopback ? eRender : eCapture);
+    auto format = monoFormat();
+    WAVEFORMATEX* native{};
+    if (loopback) check(audio->GetMixFormat(&native));
+    const std::unique_ptr<WAVEFORMATEX, decltype(&CoTaskMemFree)> storage(native, CoTaskMemFree);
+    const auto samples = native ? mixFormat(*native) : mixFormat(format);
+    const DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+        (loopback ? AUDCLNT_STREAMFLAGS_LOOPBACK : conversion);
+    check(audio->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, loopback ? 0 : 200000, 0,
+                            native ? native : &format, nullptr));
+    check(audio->SetEventHandle(event.handle));
+    ComPtr<IAudioCaptureClient> input;
+    check(audio->GetService(IID_PPV_ARGS(&input)));
+    AudioPriority priority;
+    Started started(audio.Get());
+    bool firstPacket = true;
+    Resampler resampler;
+    const HANDLE events[]{stopEvent_, event.handle};
+    for (;;) {
+        const auto wait = WaitForMultipleObjects(2, events, FALSE, loopback ? 100 : 3000);
+        if (wait == WAIT_OBJECT_0) return;
+        // No playback means no events; polling still detects invalidated endpoints.
+        if (wait == WAIT_TIMEOUT) {
+            if (!loopback) throw HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            DWORD state{};
+            check(device->GetState(&state));
+            if (state != DEVICE_STATE_ACTIVE) throw AUDCLNT_E_DEVICE_INVALIDATED;
+        } else if (wait != WAIT_OBJECT_0 + 1) {
+            throw HRESULT_FROM_WIN32(GetLastError());
+        }
+        for (;;) {
+            UINT32 pending{};
+            check(input->GetNextPacketSize(&pending));
+            if (!pending) break;
+            BYTE* data{};
+            UINT32 frames{};
+            DWORD packetFlags{};
+            const auto hr = input->GetBuffer(&data, &frames, &packetFlags, nullptr, nullptr);
+            check(hr);
+            if (hr == AUDCLNT_S_BUFFER_EMPTY) break;
+            const bool silent = (packetFlags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+            if (!silent && frames && !data) {
+                check(input->ReleaseBuffer(frames));
+                throw E_UNEXPECTED;
+            }
+            bool overflow{};
+            if (!firstPacket && (packetFlags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)) {
+                ++source.epoch;
+                resampler = {};
+            }
+            firstPacket = false;
+            const auto emit = [&](float value) { overflow = !source.queue.push(value) || overflow; };
+            for (UINT32 i = 0; i < frames && !overflow; ++i) {
+                const auto value = silent ? 0.0f : samples.mono(data + std::size_t(i) * samples.alignment);
+                if (samples.sampleRate == rate) emit(value);
+                else resampler.next(value, samples.sampleRate, emit);
+            }
+            if (overflow) {
+                ++source.epoch;
+                resampler = {};
+            }
+            check(input->ReleaseBuffer(frames));
+            if (WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0) return;
+        }
     }
 }
 
 struct Engine::MixState {
-    ClockFollower clock;
-    VoiceEq eq;
-    Ducker ducker;
+    struct Track {
+        ClockFollower clock;
+        VoiceEq eq;
+        Ducker ducker;
+        unsigned epoch{};
+    };
+    std::array<Track, maxSources> tracks;
     PeakLimiter limiter;
-    unsigned epoch{};
 };
 
-void Engine::mixBlock(MixState& s, float* dest, unsigned frames, bool hasMic, bool hasFile, bool muted) {
-    const bool useMic = hasMic && !micLost_.load();
-    const bool useFile = hasFile && playing.load() && !fileLost_.load();
-    const auto epoch = micEpoch_.load();
-    if (epoch != s.epoch) {
-        micQueue_.consume(micQueue_.size());
-        s.clock = {};
-        s.eq.resetSignal();
-        s.epoch = epoch;
+void Engine::mixBlock(MixState& state, float* dest, unsigned frames, bool muted) {
+    struct BlockTrack {
+        Source* source{};
+        float gain{}, peak{};
+        bool file{}, mic{}, mute{}, eq{}, duck{}, enabled{};
+    };
+    std::array<BlockTrack, maxSources> block;
+    for (std::size_t j = 0; j < sourceCount_; ++j) {
+        auto& track = block[j];
+        track.source = sources_[j].get();
+        auto& source = *track.source;
+        auto& dsp = state.tracks[j];
+        auto& ctl = source.controls;
+        track.file = source.config.kind == SourceKind::File;
+        track.mic = source.config.kind == SourceKind::Microphone;
+        track.enabled = !ctl.failed.load() && (!track.file || ctl.playing.load());
+        const auto gain = ctl.gain.load();
+        track.gain = std::isfinite(gain) ? std::clamp(gain, 0.0f, 2.0f) : 0.0f;
+        track.mute = ctl.mute.load();
+        track.eq = track.mic && ctl.voiceEq.load();
+        track.duck = track.file && ctl.ducking.load();
+        const auto epoch = source.epoch.load();
+        if (!track.file && epoch != dsp.epoch) {
+            source.queue.consume(source.queue.size());
+            dsp.clock = {};
+            dsp.eq.resetSignal();
+            dsp.epoch = epoch;
+        }
     }
-    const auto mg = micGain.load(), fg = fileGain.load();
-    const auto mm = micMute.load(), fm = fileMute.load();
-    const auto useEq = voiceEq.load(), useDuck = ducking.load() && useMic && !mm;
-    float mp{}, fp{}, op{};
+
+    float outputPeak{};
     for (unsigned i = 0; i < frames; ++i) {
-        const auto sample = useMic ? s.clock.next(micQueue_) : 0.0f;
-        const bool micReady = useMic && s.clock.ready();
-        if (!micReady) s.eq.resetSignal();
-        const auto mic = scaled(s.eq.next(std::isfinite(sample) ? sample : 0.0f, useEq), mg, mm);
-        float decoded{};
-        if (useFile) fileQueue_.pop(decoded);
-        const auto file = scaled(decoded, fg, fm) * s.ducker.next(mic, useDuck && micReady);
-        const auto mixed = s.limiter.next(mic + file);
-        dest[i] = muted ? 0 : mixed;
-        mp = std::max(mp, std::abs(mic));
-        fp = std::max(fp, std::abs(file));
-        op = std::max(op, std::abs(dest[i]));
+        float micLevel{}, sum{};
+        bool micReady{};
+        for (std::size_t j = 0; j < sourceCount_; ++j) {
+            auto& track = block[j];
+            if (track.file || !track.enabled) continue;
+            auto& dsp = state.tracks[j];
+            auto sample = dsp.clock.next(track.source->queue);
+            if (track.mic) {
+                if (!dsp.clock.ready()) dsp.eq.resetSignal();
+                sample = dsp.eq.next(sample, track.eq);
+            }
+            if (track.mute) continue;
+            sample *= track.gain;
+            const auto level = std::abs(sample);
+            track.peak = std::max(track.peak, level);
+            sum += sample;
+            if (track.mic && dsp.clock.ready()) {
+                micLevel = std::max(micLevel, level);
+                micReady = true;
+            }
+        }
+        for (std::size_t j = 0; j < sourceCount_; ++j) {
+            auto& track = block[j];
+            if (!track.file) continue;
+            const auto duck = state.tracks[j].ducker.next(micLevel, track.duck && micReady);
+            if (!track.enabled) continue;
+            float sample{};
+            track.source->queue.pop(sample);
+            if (track.mute) continue;
+            sample *= track.gain * duck;
+            track.peak = std::max(track.peak, std::abs(sample));
+            sum += sample;
+        }
+        const auto limited = state.limiter.next(sum);
+        dest[i] = muted ? 0.0f : limited;
+        outputPeak = std::max(outputPeak, std::abs(dest[i]));
     }
-    micPeak = mp;
-    filePeak = fp;
-    outPeak = op;
+    for (std::size_t j = 0; j < sourceCount_; ++j) {
+        auto& track = block[j];
+        auto& ctl = track.source->controls;
+        ctl.peak = track.peak;
+        if (ctl.failed.load()) ctl.peak = 0.0f;
+    }
+    outPeak = outputPeak;
 }
 
-void Engine::renderVirtual(bool hasMic, bool hasFile) {
+void Engine::renderVirtual() {
     auto path = virtualPath();
     if (path.empty()) throw HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
     VirtualWriter writer(path, stopEvent_);
@@ -421,14 +723,17 @@ void Engine::renderVirtual(bool hasMic, bool hasFile) {
     bool wasMuted{};
     while (waitAudio(stopEvent_, timer.value)) {
         const bool muted = outMute.load();
-        if (muted && !wasMuted) writer.flush();
+        if (muted) {
+            if (!wasMuted) writer.flush();
+            outPeak = 0;
+        }
         wasMuted = muted;
         const auto state = writer.query();
         ready_ = true;
         const auto frames = !state.active ? MPMIC_BLOCK_FRAMES / 2 :
             std::min(MPMIC_BLOCK_FRAMES, target - std::min(target, state.queuedFrames));
         if (!frames) continue;
-        mixBlock(mix, audio.data(), frames, hasMic, hasFile, muted);
+        mixBlock(mix, audio.data(), frames, muted);
         if (state.active) {
             if (!muted && outMute.load()) {
                 writer.flush();
@@ -446,30 +751,34 @@ void Engine::renderVirtual(bool hasMic, bool hasFile) {
     }
 }
 
-void Engine::render(std::wstring id, bool hasMic, bool hasFile) {
+void Engine::render(std::wstring id) {
     const bool direct = id == virtualMicId;
+    const auto report = [&](HRESULT hr) {
+        if (WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0) return;
+        failOutput(direct ? tr(L"与麦克风（声搭）的连接已停止，请检查驱动、权限或其他写入程序", L"MicPatch Microphone disconnected. Check the driver, permissions, or other writers.")
+                          : tr(L"输出已停止，请检查选中的播放设备", L"Output stopped. Check the selected playback device."), hr);
+        SetEvent(stopEvent_);
+    };
     try {
-        if (direct) {
-            renderVirtual(hasMic, hasFile);
-        } else {
-            renderWasapi(id, hasMic, hasFile);
-        }
+        if (direct) renderVirtual();
+        else renderWasapi(id);
     } catch (HRESULT hr) {
-        if (WaitForSingleObject(stopEvent_, 0) != WAIT_OBJECT_0) {
-            fail(direct ? tr(L"与麦克风（声搭）的连接已停止，请检查驱动、权限或其他写入程序", L"MicPatch Microphone disconnected. Check the driver, permissions, or other writers.")
-                        : tr(L"输出已停止，请检查选中的播放设备", L"Output stopped. Check the selected playback device."), hr);
-            SetEvent(stopEvent_);
-        }
+        report(hr);
+    } catch (const std::bad_alloc&) {
+        report(E_OUTOFMEMORY);
+    } catch (const std::exception&) {
+        report(E_FAIL);
     }
-    micPeak = filePeak = outPeak = 0;
+    for (std::size_t i = 0; i < sourceCount_; ++i) sources_[i]->controls.peak = 0;
+    outPeak = 0;
     ready_ = false;
     active_ = false;
 }
 
-void Engine::renderWasapi(const std::wstring& id, bool hasMic, bool hasFile) {
+void Engine::renderWasapi(const std::wstring& id) {
     Com com;
     Event event;
-    auto audio = client(id);
+    auto audio = client(deviceFor(id).Get(), eRender);
     auto format = monoFormat();
     check(audio->Initialize(AUDCLNT_SHAREMODE_SHARED, conversion | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                             200000, 0, &format, nullptr));
@@ -488,141 +797,108 @@ void Engine::renderWasapi(const std::wstring& id, bool hasMic, bool hasFile) {
     while (waitAudio(stopEvent_, event.handle)) {
         UINT32 padding{};
         check(audio->GetCurrentPadding(&padding));
+        if (padding > capacity) throw E_UNEXPECTED;
         const auto frames = capacity - padding;
         if (!frames) continue;
         check(output->GetBuffer(frames, &data));
         auto dest = reinterpret_cast<float*>(data);
-        mixBlock(mix, dest, frames, hasMic, hasFile, outMute.load());
-        check(output->ReleaseBuffer(frames, outPeak.load() == 0 ? AUDCLNT_BUFFERFLAGS_SILENT : 0));
+        mixBlock(mix, dest, frames, outMute.load());
+        const bool silent = outMute.load() || outPeak.load() == 0;
+        if (silent) outPeak = 0;
+        check(output->ReleaseBuffer(frames, silent ? AUDCLNT_BUFFERFLAGS_SILENT : 0));
     }
 }
 
-void Engine::decode(std::wstring path) {
-    try {
-        Com com;
-        Mf mf;
-        ComPtr<IMFSourceReader> reader;
-        const auto stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM);
-        check(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &reader));
-        check(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE));
-        check(reader->SetStreamSelection(stream, TRUE));
-        ComPtr<IMFMediaType> requested;
-        check(MFCreateMediaType(&requested));
-        check(requested->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio));
-        const auto setSubtype = [&](const GUID& subtype) {
-            check(requested->SetGUID(MF_MT_SUBTYPE, subtype));
-            return reader->SetCurrentMediaType(stream, nullptr, requested.Get());
-        };
-        if (FAILED(setSubtype(MFAudioFormat_Float))) check(setSubtype(MFAudioFormat_PCM));
-        UINT32 channels{}, sampleRate{}, alignment{}, bits{};
-        bool isFloat{};
-        const auto readFormat = [&] {
-            ComPtr<IMFMediaType> actual;
-            check(reader->GetCurrentMediaType(stream, &actual));
-            GUID subtype{};
-            check(actual->GetGUID(MF_MT_SUBTYPE, &subtype));
-            check(actual->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &channels));
-            check(actual->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &sampleRate));
-            check(actual->GetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, &alignment));
-            check(actual->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits));
-            isFloat = subtype == MFAudioFormat_Float;
-            if ((!isFloat && subtype != MFAudioFormat_PCM) || (isFloat && bits != 32) ||
-                (bits != 8 && bits != 16 && bits != 24 && bits != 32) ||
-                !channels || channels > 32 || sampleRate < 8000 || sampleRate > 384000 ||
-                alignment != channels * (bits / 8)) throw MF_E_INVALIDMEDIATYPE;
-        };
-        readFormat();
-        constexpr auto stopped = HRESULT_FROM_WIN32(ERROR_CANCELLED);
-        const auto enqueue = [&](float value) {
-            while (!fileQueue_.push(value)) {
-                if (WaitForSingleObject(stopEvent_, 4) == WAIT_OBJECT_0) throw stopped;
-            }
-        };
-        unsigned phase{};
-        float previous{};
-        bool havePrevious{};
-        const auto convert = [&](float value) {
-            if (havePrevious) {
-                while (phase < rate) {
-                    enqueue(previous + (value - previous) * (float(phase) / rate));
-                    phase += sampleRate;
-                }
-                phase -= rate;
-            }
-            previous = value;
-            havePrevious = true;
-        };
-        bool eof{}, restart{}, hadSamples{};
-        while (WaitForSingleObject(stopEvent_, 0) != WAIT_OBJECT_0) {
-            if (!playing || fileQueue_.size() >= 8192 || (eof && !loop && fileQueue_.size() != 0)) {
-                WaitForSingleObject(stopEvent_, 4);
+void Engine::decode(Source& source) {
+    Com com;
+    Mf mf;
+    ComPtr<IMFSourceReader> reader;
+    const auto stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM);
+    check(MFCreateSourceReaderFromURL(source.config.target.c_str(), nullptr, &reader));
+    check(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE));
+    check(reader->SetStreamSelection(stream, TRUE));
+    ComPtr<IMFMediaType> requested;
+    check(MFCreateMediaType(&requested));
+    check(requested->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio));
+    const auto setSubtype = [&](const GUID& subtype) {
+        check(requested->SetGUID(MF_MT_SUBTYPE, subtype));
+        return reader->SetCurrentMediaType(stream, nullptr, requested.Get());
+    };
+    if (FAILED(setSubtype(MFAudioFormat_Float))) check(setSubtype(MFAudioFormat_PCM));
+    SampleFormat format;
+    const auto readFormat = [&] {
+        ComPtr<IMFMediaType> actual;
+        check(reader->GetCurrentMediaType(stream, &actual));
+        GUID subtype{};
+        check(actual->GetGUID(MF_MT_SUBTYPE, &subtype));
+        if (subtype != MFAudioFormat_Float && subtype != MFAudioFormat_PCM) throw MF_E_INVALIDMEDIATYPE;
+        format.floating = subtype == MFAudioFormat_Float;
+        check(actual->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &format.channels));
+        check(actual->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &format.sampleRate));
+        check(actual->GetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, &format.alignment));
+        check(actual->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &format.bits));
+        format.validate();
+    };
+    readFormat();
+    constexpr auto stopped = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    const auto enqueue = [&](float value) {
+        while (!source.queue.push(value)) {
+            if (WaitForSingleObject(stopEvent_, 4) == WAIT_OBJECT_0) throw stopped;
+        }
+    };
+    Resampler resampler;
+    const auto convert = [&](float value) {
+        if (format.sampleRate == rate) enqueue(value);
+        else resampler.next(value, format.sampleRate, enqueue);
+    };
+    bool eof{}, restart{}, hadSamples{};
+    while (WaitForSingleObject(stopEvent_, 0) != WAIT_OBJECT_0) {
+        if (!source.controls.playing || (eof && !source.controls.loop && source.queue.size() != 0)) {
+            WaitForSingleObject(stopEvent_, 4);
+            continue;
+        }
+        if (eof) {
+            if (!hadSamples) throw MF_E_INVALIDMEDIATYPE;
+            if (!source.controls.loop) {
+                source.controls.playing = false;
+                restart = true;
+                eof = false;
                 continue;
             }
-            if (eof) {
-                if (!hadSamples) throw MF_E_INVALIDMEDIATYPE;
-                if (!loop) {
-                    playing = false;
-                    restart = true;
-                    eof = false;
-                    continue;
-                }
-                restart = true;
-            }
-            if (restart) {
-                seekStart(reader.Get());
-                restart = eof = hadSamples = havePrevious = false;
-                phase = 0;
-            }
-            DWORD flags{};
-            ComPtr<IMFSample> sample;
-            check(reader->ReadSample(stream, 0, nullptr, &flags, nullptr, &sample));
-            if (flags & MF_SOURCE_READERF_ERROR) throw E_FAIL;
-            if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
-                readFormat();
-                havePrevious = false;
-                phase = 0;
-            }
-            if (sample) {
-                ComPtr<IMFMediaBuffer> buffer;
-                check(sample->ConvertToContiguousBuffer(&buffer));
-                BYTE* data{};
-                DWORD bytes{};
-                check(buffer->Lock(&data, nullptr, &bytes));
-                try {
-                    const auto stride = bits / 8;
-                    for (DWORD frame = 0; frame < bytes / alignment; ++frame) {
-                        float sum{};
-                        for (UINT32 ch = 0; ch < channels; ++ch) {
-                            const auto p = data + frame * alignment + ch * stride;
-                            float v{};
-                            if (isFloat) {
-                                std::memcpy(&v, p, sizeof(v));
-                            } else if (bits == 8) {
-                                v = (int(*p) - 128) / 128.0f;
-                            } else {
-                                std::uint32_t word{};
-                                std::memcpy(&word, p, stride);
-                                v = static_cast<float>(static_cast<std::int32_t>(word << (32 - bits))) / 2147483648.0f;
-                            }
-                            if (std::isfinite(v)) sum += std::clamp(v, -1.0f, 1.0f);
-                        }
-                        convert(sum / float(channels));
-                    }
-                    hadSamples = hadSamples || bytes >= alignment;
-                } catch (...) {
-                    buffer->Unlock();
-                    throw;
-                }
-                check(buffer->Unlock());
-            }
-            eof = (flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0;
-            if (eof && havePrevious) convert(previous);
+            restart = true;
         }
-    } catch (HRESULT hr) {
-        if (WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0) return;
-        fileLost_ = true;
-        playing = false;
-        fail(tr(L"文件读取失败，请检查文件格式或访问权限", L"Could not read the file. Check its format and permissions."), hr);
+        if (restart) {
+            seekStart(reader.Get());
+            restart = eof = hadSamples = false;
+            resampler = {};
+        }
+        DWORD flags{};
+        ComPtr<IMFSample> sample;
+        check(reader->ReadSample(stream, 0, nullptr, &flags, nullptr, &sample));
+        if (flags & MF_SOURCE_READERF_ERROR) throw E_FAIL;
+        if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
+            readFormat();
+            resampler = {};
+        }
+        if (sample) {
+            ComPtr<IMFMediaBuffer> buffer;
+            check(sample->ConvertToContiguousBuffer(&buffer));
+            BYTE* data{};
+            DWORD bytes{};
+            check(buffer->Lock(&data, nullptr, &bytes));
+            try {
+                if (bytes % format.alignment || (bytes && !data)) throw MF_E_INVALIDMEDIATYPE;
+                for (DWORD offset = 0; offset < bytes; offset += format.alignment)
+                    convert(format.mono(data + offset));
+                hadSamples = hadSamples || bytes != 0;
+            } catch (...) {
+                buffer->Unlock();
+                throw;
+            }
+            check(buffer->Unlock());
+        }
+        eof = (flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0;
+        if (eof && resampler.havePrevious) convert(resampler.previous);
     }
 }
 }
